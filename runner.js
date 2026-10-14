@@ -296,6 +296,27 @@ function loadProxies(file) {
   return parseProxyText(fs.readFileSync(file, 'utf8'));
 }
 
+/* host/port out of a socks URL, so the daemon can be probed before use. */
+function socksEndpoint(url) {
+  try {
+    const u = new URL(url);
+    return { host: u.hostname || '127.0.0.1', port: Number(u.port) || 9050 };
+  } catch {
+    return { host: '127.0.0.1', port: 9050 };
+  }
+}
+
+function probeTcp(host, port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    const done = (ok) => { sock.destroy(); resolve(ok); };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => done(true));
+    sock.once('timeout', () => done(false));
+    sock.once('error', () => done(false));
+  });
+}
+
 /* ---------- runner ---------- */
 const DEFAULTS = {
   baseUrl: 'https://guns.lol',
@@ -333,6 +354,8 @@ class Runner extends EventEmitter {
     this.startedAt = null;
     this.lastError = null;
     this.plan = null;
+    this.torControlDown = false;
+    this.torWarned = false;
   }
 
   status() {
@@ -392,8 +415,14 @@ class Runner extends EventEmitter {
   }
 
   async _newIdentity() {
+    // Known-dead control port: don't burn ten timed-out connects on it.
+    if (this.torControlDown) return;
     try { await this._torNewCircuit(); await sleep(1500); }
-    catch (e) { this.log('warn', 'tor', `circuit rotate failed (${e.message}) — reusing exit`); }
+    catch (e) {
+      if (this.torWarned) return;      // once per run, not once per worker
+      this.torWarned = true;
+      this.log('warn', 'tor', `cannot rotate exit circuits (${e.message}) — every hit shares one exit`);
+    }
   }
 
   async _dwell(page) {
@@ -477,6 +506,18 @@ class Runner extends EventEmitter {
       ({ proxies, bad } = loadProxies(o.proxyFile));
     }
 
+    // Tor mode with no daemon is a guaranteed ten-way failure. Check first.
+    let torControlDown = false;
+    if (!proxies.length) {
+      const socks = socksEndpoint(o.torSocks);
+      if (!(await probeTcp(socks.host, socks.port))) {
+        throw new Error(
+          `no proxies supplied and nothing is listening on ${o.torSocks} — start Tor (npm run tor) or paste proxies in the box`,
+        );
+      }
+      torControlDown = !(await probeTcp(o.torControlHost, o.torControlPort));
+    }
+
     const browsers = clamp(opts.browsers ?? o.browsers, 1, 8);
     const pages = clamp(opts.pages ?? o.pages, 1, 10);
     const headless = opts.headless === undefined ? o.headless : !!opts.headless;
@@ -495,6 +536,7 @@ class Runner extends EventEmitter {
       navTimeout: o.navTimeout,
       torSocks: o.torSocks,
     };
+    this.torControlDown = torControlDown;
 
     this.running = true;
     this.startedAt = Date.now();
@@ -503,6 +545,9 @@ class Runner extends EventEmitter {
     this.log('info', 'boot', this.plan.mode === 'tor'
       ? `egress TOR ${this.plan.torSocks} (fresh circuit per hit)`
       : `egress ${proxies.length} proxies (round-robin)`);
+    if (this.plan.mode === 'tor' && torControlDown) {
+      this.log('warn', 'tor', `control port ${o.torControlHost}:${o.torControlPort} not open — every hit shares one exit (add ControlPort to torrc to rotate)`);
+    }
     if (bad.length) this.log('warn', 'boot', `${bad.length} proxy line(s) unparsed and ignored`);
     this._emitState();
 

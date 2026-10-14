@@ -9,6 +9,7 @@
  * and teardown. Everything it asserts is behaviour a user can see.
  */
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -149,13 +150,49 @@ async function main() {
   check('listener closed after shutdown', await refuses(port));
 
   console.log('\nTor mode');
-  let app2;
-  try {
-    app2 = await launchApp({ PROXY_FILE: emptyFile, ...fast });
-  } catch (e) {
-    console.log(`  FAIL  tor-mode server boots  — ${e.message}`);
-    process.exit(1);
-  }
+
+  // No daemon at all: refuse up front rather than launch ten browsers that cannot connect.
+  const appDown = await launchApp({ PROXY_FILE: emptyFile, ...fast });
+  const refused = await post(appDown.port, '/api/start', { target: 'torcheck', browsers: 2, pages: 5 });
+  const refusedBody = JSON.parse(refused.body);
+  check('no daemon: run refused with 400', refused.status === 400, `${refused.status} ${refused.body.slice(0, 90)}`);
+  check('no daemon: message names the socks address and the fix',
+    /socks5:\/\/127\.0\.0\.1:9050/.test(refusedBody.error || '') && /npm run tor/.test(refusedBody.error || ''),
+    refusedBody.error);
+  check('no daemon: nothing was launched', !/"running":true/.test(refused.body));
+  appDown.child.kill('SIGTERM');
+  await sleep(600);
+
+  // With a daemon present, tor mode engages and exits rotate over the control port.
+  const controlSeen = [];
+  const fakeControl = net.createServer((sock) => {
+    sock.on('error', () => {});
+    let buf = '';
+    sock.on('data', (d) => {
+      buf += d.toString();
+      let i;
+      while ((i = buf.indexOf('\r\n')) !== -1) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!line) continue;
+        controlSeen.push(line.split(' ')[0]);
+        sock.write('250 OK\r\n');
+        if (line.startsWith('QUIT')) sock.end();
+      }
+    });
+  });
+  // Accepts the TCP connect (enough for the preflight) then drops it, so the
+  // navigation fails promptly instead of waiting out a SOCKS handshake.
+  const fakeSocks = net.createServer((sock) => { sock.on('error', () => {}); sock.destroy(); });
+  await new Promise((r) => fakeControl.listen(0, '127.0.0.1', r));
+  await new Promise((r) => fakeSocks.listen(0, '127.0.0.1', r));
+  const socksUrl = `socks5://127.0.0.1:${fakeSocks.address().port}`;
+
+  const app2 = await launchApp({
+    PROXY_FILE: emptyFile,
+    TOR_SOCKS: socksUrl,
+    TOR_PORT: String(fakeControl.address().port),
+    ...fast,
+  });
   const torFrames = [];
   const sse2 = http.get({ host: '127.0.0.1', port: app2.port, path: '/api/events' }, (res) => {
     res.on('data', (d) => torFrames.push(d.toString()));
@@ -163,8 +200,8 @@ async function main() {
   await sleep(300);
 
   const tstarted = await post(app2.port, '/api/start', { target: 'torcheck', browsers: 1, pages: 1 });
-  check('start accepted with no proxies', tstarted.status === 200);
-  check('mode falls back to tor', JSON.parse(tstarted.body).status.mode === 'tor');
+  check('daemon present: start accepted', tstarted.status === 200, tstarted.body.slice(0, 110));
+  check('mode falls back to tor', tstarted.status === 200 && JSON.parse(tstarted.body).status.mode === 'tor');
 
   let tst = null;
   for (let i = 0; i < 50; i++) {
@@ -174,15 +211,20 @@ async function main() {
   }
   const terr = (tst && tst.lastError) || '';
   check('socks target resolved (not undefined)', !/got undefined/.test(terr), terr);
-  check('failure is the socks connect, as expected without a daemon', /ERR_PROXY_CONNECTION_FAILED|ECONNREFUSED|socks/i.test(terr), terr);
-  const torStream = torFrames.join('');
-  check('exit circuit rotation attempted', /circuit rotate failed/.test(torStream));
-  check('boot log names the tor egress', /egress TOR socks5:\/\/127\.0\.0\.1:9050/.test(torStream));
+  // Which connection error chromium reports varies (proxy refused vs reset);
+  // what matters is that it is a real connection failure, not a bad proxy option.
+  check('navigation fails at the stand-in socks, as expected',
+    /ERR_(PROXY_)?CONNECTION_(RESET|FAILED|CLOSED)|ECONNREFUSED|ERR_PROXY/i.test(terr), terr);
+  check('exit circuits rotated over the control port',
+    controlSeen.includes('AUTHENTICATE') && controlSeen.includes('SIGNAL'), JSON.stringify(controlSeen.slice(0, 6)));
+  check('boot log names the tor egress', /egress TOR socks5:\/\/127\.0\.0\.1:/.test(torFrames.join('')));
 
   sse2.destroy();
   await post(app2.port, '/api/stop', {});
   app2.child.kill('SIGTERM');
   await sleep(600);
+  fakeControl.close();
+  fakeSocks.close();
 
   fs.unlinkSync(proxiesFile);
   fs.unlinkSync(emptyFile);
