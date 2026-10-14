@@ -8,7 +8,33 @@
  */
 const fs = require('fs');
 const net = require('net');
+const path = require('path');
 const { EventEmitter } = require('events');
+
+/*
+ * Runtime bootstrap — must run BEFORE playwright is required.
+ *
+ * Playwright resolves its browser cache from HOME, so a browser installed as
+ * one user is invisible to another: the classic "Executable doesn't exist at
+ * /root/.cache/ms-playwright/..." immediately after a successful install.
+ * Pinning the cache inside the project makes it independent of who runs it.
+ *
+ * .pwlibs is the same idea for the shared objects chromium links against: on
+ * hosts where they cannot be installed system-wide (no root), the packages are
+ * extracted here and this puts them ahead of chromium's loader. Absolute path,
+ * child processes only — the running node process already resolved its own.
+ */
+const PROJECT_BROWSERS = path.join(__dirname, '.playwright-browsers');
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH && fs.existsSync(PROJECT_BROWSERS)) {
+  process.env.PLAYWRIGHT_BROWSERS_PATH = PROJECT_BROWSERS;
+}
+const PROJECT_LIBS = path.join(__dirname, '.pwlibs', 'usr', 'lib', 'x86_64-linux-gnu');
+if (!process.env.PLAYWRIGHT_SKIP_LOCAL_LIBS && fs.existsSync(PROJECT_LIBS)) {
+  process.env.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH
+    ? `${PROJECT_LIBS}:${process.env.LD_LIBRARY_PATH}`
+    : PROJECT_LIBS;
+}
+
 const { chromium } = require('playwright');
 
 const UAS = [
@@ -82,7 +108,12 @@ const DEFAULTS = {
 class Runner extends EventEmitter {
   constructor(defaults = {}) {
     super();
-    this.defaults = { ...DEFAULTS, ...defaults };
+    // An explicit `undefined` must not clobber a real default — callers pass
+    // env-driven options that are often unset (TOR_SOCKS, TOR_PASSWORD).
+    const overrides = Object.fromEntries(
+      Object.entries(defaults).filter(([, v]) => v !== undefined),
+    );
+    this.defaults = { ...DEFAULTS, ...overrides };
     this._clear();
   }
 
@@ -268,19 +299,32 @@ class Runner extends EventEmitter {
     this._emitState();
 
     let slot = 0;
-    for (let b = 0; b < browsers; b++) {
-      const browser = await chromium.launch({
-        headless,
-        args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-      });
-      if (this.stopping) { await browser.close().catch(() => {}); break; }
-      this.browsers.push(browser);
-      for (let p = 0; p < pages; p++) {
-        const proxy = this.plan.mode === 'tor' ? null : proxies[slot++ % proxies.length];
-        const handle = this._worker(browser, proxy, `${b + 1}.${p + 1}`)
-          .catch((e) => this.log('error', 'worker', e.message));
-        this.workerHandles.push(handle);
+    try {
+      for (let b = 0; b < browsers; b++) {
+        const browser = await chromium.launch({
+          headless,
+          args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
+        });
+        if (this.stopping) { await browser.close().catch(() => {}); break; }
+        this.browsers.push(browser);
+        for (let p = 0; p < pages; p++) {
+          const proxy = this.plan.mode === 'tor' ? null : proxies[slot++ % proxies.length];
+          const handle = this._worker(browser, proxy, `${b + 1}.${p + 1}`)
+            .catch((e) => this.log('error', 'worker', e.message));
+          this.workerHandles.push(handle);
+        }
       }
+    } catch (e) {
+      // Roll back so the UI never claims a run that never launched, and turn
+      // playwright's cache-miss stack trace into the one command that fixes it.
+      this.stopping = true;
+      await Promise.allSettled(this.browsers.map((x) => x.close()));
+      this._clear();
+      this.log('error', 'boot', e.message.split('\n')[0]);
+      this._emitState();
+      throw new Error(/Executable doesn't exist|ENOENT/i.test(e.message)
+        ? `chromium is not installed — run: npm run setup  (looked in ${chromium.executablePath()})`
+        : e.message);
     }
     return this.status();
   }

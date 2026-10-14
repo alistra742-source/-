@@ -2,6 +2,10 @@ node_modules/
 npm-debug.log*
 .DS_Store
 
+# chromium download + locally extracted native libs (machine-specific)
+.playwright-browsers/
+.pwlibs/
+
 # local proxy lists and scratch runs stay off the repo
 .e2e-proxies.txt
 .empty-proxies.txt

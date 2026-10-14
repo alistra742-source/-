@@ -15,8 +15,11 @@ const fs = require('fs');
 const path = require('path');
 const { Runner } = require('./runner');
 
+// Port 0 is valid ("bind any free port") and must survive the filter.
 const PORTS = String(process.env.PORT || process.env.PORTS || '8080')
-  .split(',').map((s) => Number(s.trim())).filter(Boolean);
+  .split(',').map((s) => Number(s.trim()))
+  .filter((n) => Number.isInteger(n) && n >= 0 && n <= 65535);
+if (!PORTS.length) PORTS.push(8080);
 const HOST = process.env.HOST || '0.0.0.0';
 const BASE_URL = process.env.BASE_URL || 'https://guns.lol';
 const PROXY_FILE = process.env.PROXY_FILE || path.join(__dirname, 'proxies.txt');
@@ -150,7 +153,8 @@ for (const port of PORTS) {
   });
   s.listen(port, HOST, () => {
     bound++;
-    console.log(`[serve] http://${HOST}:${port}  (ui)`);
+    // report the port actually bound, so PORT=0 is usable
+    console.log(`[serve] http://${HOST}:${s.address().port}  (ui)`);
     if (bound === PORTS.length) console.log(`[serve] engine ready — proxy file: ${PROXY_FILE}`);
   });
   servers.push(s);
