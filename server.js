@@ -13,7 +13,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { Runner, ensureChromium, chromiumExecutable } = require('./runner');
+const { Runner, ensureChromium, ensureChromiumDeps, chromiumExecutable } = require('./runner');
 
 // Port 0 is valid ("bind any free port") and must survive the filter.
 const PORTS = String(process.env.PORT || process.env.PORTS || '8080')
@@ -134,9 +134,11 @@ async function handle(req, res) {
   res.end(JSON.stringify({ error: 'not found' }));
 }
 
-// Warm the browser at boot so the first Start click is not a two-minute stall.
-// Non-fatal: the server still serves the UI, and /api/start reports the fix.
+// Warm the browser AND its system libraries at boot, so the first Start click
+// is not a two-minute stall. Non-fatal: the server still serves the UI either
+// way, and /api/start reports the fix if this could not resolve it.
 ensureChromium((m) => console.log(`[setup] ${m}`))
+  .then(() => ensureChromiumDeps((m) => console.log(`[setup] ${m}`)))
   .then(() => console.log('[serve] chromium ready'))
   .catch((e) => console.warn(`[serve] ${e.message}`));
 
