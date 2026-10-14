@@ -1,0 +1,15 @@
+# One proxy per line. Any of these four shapes is accepted.
+# Lines starting with # are ignored. Blank lines ignored.
+#
+# host:port
+# host:port:username:password
+# scheme://host:port
+# scheme://username:password@host:port
+#
+# scheme defaults to http when omitted. socks5 / socks5h also valid.
+#
+# --- examples (delete the samples, drop your own in) ---
+# 203.0.113.10:8080
+# 198.51.100.24:3128:proxyuser:proxypass
+# http://203.0.113.55:8000
+# socks5://user:pass@198.51.100.9:1080
