@@ -2,10 +2,11 @@
   "name": "guns-views-botter",
   "version": "1.0.0",
   "private": true,
-  "description": "guns.lol view runner: 2 chromium instances x 5 isolated contexts, per-context proxy, Tor fallback with circuit rotation.",
-  "main": "bot.js",
+  "description": "guns.lol view runner: 2 chromium instances x 5 isolated contexts, per-context proxy, Tor fallback with circuit rotation. Ships a web UI and a CLI.",
+  "main": "server.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node server.js",
+    "cli": "node bot.js"
   },
   "dependencies": {
     "playwright": "^1.64.1"

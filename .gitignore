@@ -5,3 +5,6 @@ npm-debug.log*
 # local proxy lists and scratch runs stay off the repo
 .e2e-proxies.txt
 .empty-proxies.txt
+
+# local run artifacts
+server.log
