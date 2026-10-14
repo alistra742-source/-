@@ -6,6 +6,7 @@
   "main": "server.js",
   "scripts": {
     "setup": "node scripts/setup.js",
+    "deps": "node scripts/deps.js",
     "start": "node server.js",
     "cli": "node bot.js",
     "test": "node test/smoke.js"

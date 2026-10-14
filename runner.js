@@ -31,12 +31,39 @@ const PROJECT_BROWSERS = path.join(__dirname, '.playwright-browsers');
 if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
   process.env.PLAYWRIGHT_BROWSERS_PATH = PROJECT_BROWSERS;
 }
-const PROJECT_LIBS = path.join(__dirname, '.pwlibs', 'usr', 'lib', 'x86_64-linux-gnu');
-if (!process.env.PLAYWRIGHT_SKIP_LOCAL_LIBS && fs.existsSync(PROJECT_LIBS)) {
-  process.env.LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH
-    ? `${PROJECT_LIBS}:${process.env.LD_LIBRARY_PATH}`
-    : PROJECT_LIBS;
+const PROJECT_LIBS_ROOT = path.join(__dirname, '.pwlibs');
+const BASE_LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH || '';
+
+/* Every directory under .pwlibs that actually holds shared objects. The layout
+ * differs by distro and architecture (usr/lib/x86_64-linux-gnu, lib/aarch64-…),
+ * so walk it instead of assuming a path. */
+function collectLibDirs(root, maxDepth = 6) {
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > maxDepth || found.length > 64) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    let hasLib = false;
+    for (const e of entries) {
+      if (e.isDirectory()) walk(path.join(dir, e.name), depth + 1);
+      else if (/\.so(\.|$)/.test(e.name)) hasLib = true;
+    }
+    if (hasLib) found.push(dir);
+  };
+  walk(root, 0);
+  return found;
 }
+
+/* Rebuildable so it can be re-run after libraries are installed at runtime. */
+function applyLibPath() {
+  if (process.env.PLAYWRIGHT_SKIP_LOCAL_LIBS) return [];
+  const dirs = fs.existsSync(PROJECT_LIBS_ROOT) ? collectLibDirs(PROJECT_LIBS_ROOT) : [];
+  const combined = [...dirs, BASE_LD_LIBRARY_PATH].filter(Boolean).join(':');
+  if (combined) process.env.LD_LIBRARY_PATH = combined;
+  else delete process.env.LD_LIBRARY_PATH;
+  return dirs;
+}
+applyLibPath();
 
 const { chromium } = require('playwright');
 
@@ -89,6 +116,131 @@ function ensureChromium(log = () => {}) {
     throw new Error(`chromium is not installed and could not be downloaded — run: npm run setup  (looked in ${exe})`);
   })();
   return ensurePromise;
+}
+
+/*
+ * The OS libraries chromium links against. A slim container usually has few of
+ * them, which shows up as "error while loading shared libraries: libglib-2.0.so
+ * .0". Package names differ across releases (Ubuntu 24.04 renamed several to
+ * -t64), so both spellings are offered and misses are harmless.
+ */
+const DEB_PACKAGES = [
+  'libglib2.0-0t64', 'libglib2.0-0', 'libnss3', 'libnspr4',
+  'libatk1.0-0t64', 'libatk1.0-0', 'libatk-bridge2.0-0t64', 'libatk-bridge2.0-0',
+  'libatspi2.0-0t64', 'libatspi2.0-0', 'libcups2t64', 'libcups2',
+  'libdrm2', 'libxkbcommon0', 'libxcomposite1', 'libxdamage1', 'libxfixes3',
+  'libxrandr2', 'libgbm1', 'libpango-1.0-0', 'libcairo2',
+  'libasound2t64', 'libasound2', 'libxi6', 'libxrender1', 'libexpat1',
+  'libx11-6', 'libxcb1', 'libxext6', 'libwayland-client0',
+];
+
+function hasCmd(cmd) {
+  if (process.platform === 'win32') return false;
+  return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
+}
+
+/* Ask the binary itself, so this matches what a real launch will do. */
+function probeChromium(exe) {
+  const r = spawnSync(exe, ['--version'], { encoding: 'utf8', timeout: 20000 });
+  const text = `${r.stdout || ''}${r.stderr || ''}`;
+  const m = text.match(/error while loading shared libraries: ([^:]+):/);
+  if (m) return { ok: false, missing: m[1] };
+  if (r.error) return { ok: false, missing: null, error: r.error.message };
+  return { ok: r.status === 0, missing: null };
+}
+
+/* Never unpack the C library locally: prepending a second glibc to
+ * LD_LIBRARY_PATH breaks child processes in ways that look like anything. */
+const DEB_SKIP = new Set(['libc6', 'libc6-dev', 'libcrypt1', 'libgcc-s1', 'libgcc1', 'libstdc++6', 'dpkg', 'perl-base']);
+
+/* Direct dependency names of a .deb, reduced to plain package names. */
+function debDeps(file) {
+  const r = spawnSync('dpkg-deb', ['-f', file, 'Depends'], { encoding: 'utf8' });
+  if (r.status !== 0 || !r.stdout) return [];
+  return r.stdout
+    .split(',')
+    .map((s) => s.trim().split('|')[0])            // first alternative only
+    .map((s) => s.replace(/\(.*?\)/g, '').trim())   // drop version constraints
+    .map((s) => s.split(':')[0].trim())            // drop arch qualifier
+    .filter((s) => /^[a-z0-9][a-z0-9+.-]*$/.test(s) && !DEB_SKIP.has(s));
+}
+
+/* No root: fetch the packages and unpack them into .pwlibs, following each
+ * package's own dependencies — libcups2 needs avahi, and so on. */
+function installDepsRootless(log) {
+  if (!hasCmd('apt-get') || !hasCmd('dpkg-deb')) return false;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-debs-'));
+  try {
+    log('downloading chromium system libraries into .pwlibs…');
+    const wanted = new Set();
+    let queue = DEB_PACKAGES;
+    for (let round = 0; round < 5 && queue.length; round++) {
+      // One name at a time: apt-get download aborts the whole batch on a single
+      // unknown package, and half these names do not exist on any given release.
+      for (const pkg of queue) {
+        if (wanted.has(pkg) || DEB_SKIP.has(pkg)) continue;
+        wanted.add(pkg);
+        spawnSync('apt-get', ['download', pkg], { cwd: tmp, stdio: 'ignore' });
+      }
+      const next = new Set();
+      for (const f of fs.readdirSync(tmp).filter((n) => n.endsWith('.deb'))) {
+        for (const dep of debDeps(path.join(tmp, f))) if (!wanted.has(dep)) next.add(dep);
+      }
+      queue = [...next];
+      if (queue.length) log(`resolving ${queue.length} dependency package(s)…`);
+    }
+    const debs = fs.readdirSync(tmp).filter((f) => f.endsWith('.deb'));
+    if (!debs.length) { log('no packages could be downloaded (is there an apt index — apt-get update)?'); return false; }
+    fs.mkdirSync(PROJECT_LIBS_ROOT, { recursive: true });
+    let ok = 0;
+    for (const f of debs) {
+      if (spawnSync('dpkg-deb', ['-x', path.join(tmp, f), PROJECT_LIBS_ROOT], { stdio: 'ignore' }).status === 0) ok++;
+    }
+    log(`extracted ${ok}/${debs.length} package(s), dependencies included`);
+    return ok > 0;
+  } catch (e) {
+    log(`could not unpack packages (${e.message})`);
+    return false;
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+let depsPromise = null;
+
+/*
+ * Guarantee chromium can actually start. Root gets the supported path
+ * (playwright install-deps); without root the libraries are unpacked locally.
+ * Either way it retries the real binary before giving up.
+ */
+function ensureChromiumDeps(log = () => {}) {
+  if (depsPromise) return depsPromise;
+  depsPromise = (async () => {
+    const exe = chromiumExecutable();
+    let probe = probeChromium(exe);
+    if (probe.ok) return true;
+    if (!probe.missing) { depsPromise = null; throw new Error(probe.error || 'chromium failed to start'); }
+
+    log(`chromium cannot start — missing ${probe.missing}`);
+
+    if (typeof process.getuid === 'function' && process.getuid() === 0 && fs.existsSync(playwrightBin())) {
+      log('installing OS dependencies (playwright install-deps)…');
+      spawnSync(playwrightBin(), ['install-deps', 'chromium'], { stdio: 'inherit', env: process.env });
+      probe = probeChromium(exe);
+      if (probe.ok) { log('chromium can start'); return true; }
+      log(`install-deps did not resolve ${probe.missing}`);
+    }
+
+    if (installDepsRootless(log)) {
+      applyLibPath();
+      probe = probeChromium(exe);
+      if (probe.ok) { log('chromium can start'); return true; }
+    }
+
+    depsPromise = null;
+    throw new Error(`chromium is missing system libraries (${probe.missing}) — run: npm run deps  (as root: npx playwright install-deps chromium)`);
+  })();
+  return depsPromise;
 }
 
 const UAS = [
@@ -309,6 +461,7 @@ class Runner extends EventEmitter {
   async start(opts = {}) {
     if (this.running) throw new Error('already running');
     await ensureChromium((m) => this.log('info', 'boot', m));
+    await ensureChromiumDeps((m) => this.log('info', 'boot', m));
     const o = { ...this.defaults, ...opts };
 
     const target = String(opts.target || '').trim().replace(/^\/+|\/+$/g, '');
@@ -377,9 +530,14 @@ class Runner extends EventEmitter {
       this._clear();
       this.log('error', 'boot', e.message.split('\n')[0]);
       this._emitState();
-      throw new Error(/Executable doesn't exist|ENOENT/i.test(e.message)
-        ? `chromium is not installed — run: npm run setup  (looked in ${chromium.executablePath()})`
-        : e.message);
+      if (/Executable doesn't exist|ENOENT/i.test(e.message)) {
+        throw new Error(`chromium is not installed — run: npm run setup  (looked in ${chromium.executablePath()})`);
+      }
+      const lib = e.message.match(/error while loading shared libraries: ([^:]+):/);
+      if (lib) {
+        throw new Error(`chromium is missing the system library ${lib[1]} — run: npm run deps  (as root: npx playwright install-deps chromium)`);
+      }
+      throw e;
     }
     return this.status();
   }
@@ -399,4 +557,7 @@ class Runner extends EventEmitter {
   }
 }
 
-module.exports = { Runner, parseProxyLine, parseProxyText, loadProxies, ensureChromium, chromiumExecutable, PROJECT_BROWSERS };
+module.exports = {
+  Runner, parseProxyLine, parseProxyText, loadProxies,
+  ensureChromium, ensureChromiumDeps, chromiumExecutable, PROJECT_BROWSERS,
+};
