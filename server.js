@@ -13,7 +13,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { Runner } = require('./runner');
+const { Runner, ensureChromium, chromiumExecutable } = require('./runner');
 
 // Port 0 is valid ("bind any free port") and must survive the filter.
 const PORTS = String(process.env.PORT || process.env.PORTS || '8080')
@@ -89,7 +89,7 @@ async function handle(req, res) {
   const route = `${req.method} ${url.pathname}`;
 
   if (route === 'GET /' || route === 'GET /index.html') return serveIndex(res);
-  if (route === 'GET /health') return json(res, 200, { ok: true, ...runner.status() });
+  if (route === 'GET /health') return json(res, 200, { ok: true, chromium: fs.existsSync(chromiumExecutable()), ...runner.status() });
   if (route === 'GET /api/status') return json(res, 200, runner.status());
 
   if (route === 'GET /api/events') {
@@ -133,6 +133,12 @@ async function handle(req, res) {
   res.writeHead(404, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify({ error: 'not found' }));
 }
+
+// Warm the browser at boot so the first Start click is not a two-minute stall.
+// Non-fatal: the server still serves the UI, and /api/start reports the fix.
+ensureChromium((m) => console.log(`[setup] ${m}`))
+  .then(() => console.log('[serve] chromium ready'))
+  .catch((e) => console.warn(`[serve] ${e.message}`));
 
 // One http.Server per port: a single Server cannot listen on two ports at once,
 // and the second listen() silently leaves the first unbound.

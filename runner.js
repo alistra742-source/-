@@ -8,16 +8,19 @@
  */
 const fs = require('fs');
 const net = require('net');
+const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
+const { spawnSync } = require('child_process');
 
 /*
  * Runtime bootstrap — must run BEFORE playwright is required.
  *
  * Playwright resolves its browser cache from HOME, so a browser installed as
  * one user is invisible to another: the classic "Executable doesn't exist at
- * /root/.cache/ms-playwright/..." immediately after a successful install.
- * Pinning the cache inside the project makes it independent of who runs it.
+ * /root/.cache/ms-playwright/...". The cache is therefore pinned to this
+ * project, unconditionally — never falling back to a home directory, so the
+ * lookup cannot disagree with where the browser was installed.
  *
  * .pwlibs is the same idea for the shared objects chromium links against: on
  * hosts where they cannot be installed system-wide (no root), the packages are
@@ -25,7 +28,7 @@ const { EventEmitter } = require('events');
  * child processes only — the running node process already resolved its own.
  */
 const PROJECT_BROWSERS = path.join(__dirname, '.playwright-browsers');
-if (!process.env.PLAYWRIGHT_BROWSERS_PATH && fs.existsSync(PROJECT_BROWSERS)) {
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
   process.env.PLAYWRIGHT_BROWSERS_PATH = PROJECT_BROWSERS;
 }
 const PROJECT_LIBS = path.join(__dirname, '.pwlibs', 'usr', 'lib', 'x86_64-linux-gnu');
@@ -36,6 +39,57 @@ if (!process.env.PLAYWRIGHT_SKIP_LOCAL_LIBS && fs.existsSync(PROJECT_LIBS)) {
 }
 
 const { chromium } = require('playwright');
+
+const chromiumExecutable = () => chromium.executablePath();
+
+/* Other places a usable cache might already live — reused instead of re-downloading. */
+function browserCacheCandidates() {
+  const out = [];
+  const pinned = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (pinned && pinned !== '0') out.push(pinned);
+  try { out.push(path.join(os.homedir(), '.cache', 'ms-playwright')); } catch { /* no home */ }
+  return out;
+}
+
+const playwrightBin = () => path.join(__dirname, 'node_modules', '.bin', process.platform === 'win32' ? 'playwright.cmd' : 'playwright');
+
+let ensurePromise = null;
+
+/*
+ * Guarantee chromium exists, once per process. Idempotent and race-safe.
+ * Order: already installed -> reuse a cache found elsewhere -> download it.
+ * Only if all three fail does this throw, and when it throws it names the fix.
+ */
+function ensureChromium(log = () => {}) {
+  if (ensurePromise) return ensurePromise;
+  ensurePromise = (async () => {
+    const exe = chromiumExecutable();
+    if (fs.existsSync(exe)) return exe;
+
+    for (const dir of browserCacheCandidates()) {
+      if (dir === PROJECT_BROWSERS || !fs.existsSync(dir)) continue;
+      try {
+        if (fs.existsSync(PROJECT_BROWSERS)) fs.rmSync(PROJECT_BROWSERS, { recursive: true, force: true });
+        fs.symlinkSync(dir, PROJECT_BROWSERS, process.platform === 'win32' ? 'junction' : 'dir');
+        if (fs.existsSync(exe)) { log(`reusing existing browser cache at ${dir}`); return exe; }
+      } catch { /* fall through to a real install */ }
+    }
+
+    const bin = playwrightBin();
+    if (fs.existsSync(bin)) {
+      log('chromium missing — downloading it now (one time, ~120 MB)…');
+      const r = spawnSync(bin, ['install', 'chromium'], {
+        stdio: 'inherit',
+        env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: PROJECT_BROWSERS },
+      });
+      if (r.status === 0 && fs.existsSync(exe)) { log('chromium ready'); return exe; }
+    }
+
+    ensurePromise = null;   // let a later attempt retry once the user has fixed it
+    throw new Error(`chromium is not installed and could not be downloaded — run: npm run setup  (looked in ${exe})`);
+  })();
+  return ensurePromise;
+}
 
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -254,6 +308,7 @@ class Runner extends EventEmitter {
 
   async start(opts = {}) {
     if (this.running) throw new Error('already running');
+    await ensureChromium((m) => this.log('info', 'boot', m));
     const o = { ...this.defaults, ...opts };
 
     const target = String(opts.target || '').trim().replace(/^\/+|\/+$/g, '');
@@ -344,4 +399,4 @@ class Runner extends EventEmitter {
   }
 }
 
-module.exports = { Runner, parseProxyLine, parseProxyText, loadProxies };
+module.exports = { Runner, parseProxyLine, parseProxyText, loadProxies, ensureChromium, chromiumExecutable, PROJECT_BROWSERS };
