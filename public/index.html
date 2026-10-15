@@ -157,13 +157,13 @@ function renderCam(state) {
   }
 }
 
-// Refresh every cell's frame every 2s while a run is live.
+// Refresh every cell's frame every second while a run is live.
 setInterval(() => {
   if (!lastState || !lastState.running) return;
   for (const img of document.querySelectorAll('#cam img')) {
     img.src = `/api/frame/${img.id.slice(4)}?t=${Date.now()}`;
   }
-}, 2000);
+}, 1000);
 
 function render(state) {
   if (!state) return;
@@ -246,7 +246,7 @@ function connect() {
 
 connect();
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 1000);
 setInterval(() => { if (lastState && lastState.running) render({ ...lastState, uptime: Date.now() - lastState.startedAt }); }, 1000);
 </script>
 </body>

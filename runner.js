@@ -473,7 +473,7 @@ class Runner extends EventEmitter {
 
         context = await browser.newContext(opts);
         const page = await context.newPage();
-        // Live cam: a small JPEG of this page every 2s, skipped while one is still in flight.
+        // Live cam: a small JPEG of this page every second, skipped while one is still in flight.
         let shooting = false;
         cam = setInterval(() => {
           if (shooting || this.stopping) return;
@@ -482,7 +482,7 @@ class Runner extends EventEmitter {
             .then((jpg) => { if (!this.stopping) this.frames.set(id, { jpg, at: Date.now() }); })
             .catch(() => {})
             .finally(() => { shooting = false; });
-        }, 2000);
+        }, 1000);
         await page.addInitScript(() => {
           Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
           Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
