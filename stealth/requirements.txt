@@ -1,0 +1,20 @@
+# Camoufox stealth rig — Python deps.
+#
+# Camoufox ships its own patched Firefox; after installing, fetch the binary:
+#     pip install -r stealth/requirements.txt
+#     camoufox fetch        # or:  python -m camoufox fetch
+
+# Stealth Firefox build + Playwright driver. Playwright must stay < 1.63
+# (Camoufox pins the driver interface; 1.63 changed launch internals).
+camoufox[geoip]>=0.5,<1.0
+playwright>=1.49,<1.63
+
+# TLS/JA3-JA4 ClientHello impersonation on the fast HTTP path.
+curl_cffi>=0.7
+
+# Fingerprint generators. Install at least one; the rig falls back to a
+# built-in coherent identity if neither is present.
+#   fpgen        — Camoufox's current generator (preferred)
+#   browserforge — upstream generator (older Camoufox path)
+# fpgen>=0.1
+# browserforge>=1.2

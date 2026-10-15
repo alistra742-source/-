@@ -12,3 +12,11 @@ npm-debug.log*
 
 # local run artifacts
 server.log
+
+# python stealth rig
+.venv/
+.foxlibs/
+.fxlibs-tmp/
+.stealth-state/
+__pycache__/
+*.pyc

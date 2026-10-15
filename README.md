@@ -55,6 +55,27 @@ may be missing too. `npm run deps` installs them: with root it runs
 them into `.pwlibs/`. Either way it re-runs the real binary before reporting
 success.
 
+## Stealth engine (Camoufox)
+
+Beside this Chromium runner there is a higher-stealth engine in `stealth/` — a
+patched Firefox (Camoufox) driven by Python, with a coherent fingerprint, a
+recorded-motion humanizer, TLS/JA3 impersonation on the fast HTTP path, and a
+Cloudflare Turnstile handler. Same proxy grammar and CLI ergonomics.
+
+```bash
+pip install -r stealth/requirements.txt
+camoufox fetch
+python -m stealth <username> --contexts 2 --proxy-file proxies.txt
+python stealth/scripts/check_rig.py   # offline fleet/egress checks, no browser
+```
+
+Workers that share a proxy (or run with none) share one Cloudflare clearance
+instead of each solving the same challenge on the same IP, and their egress
+outcomes are remembered between runs — see [STEALTH.md](STEALTH.md) for the
+install (including the Linux GTK runtime), the architecture, the checks, and the
+honest limits. The Chromium runner is built for volume through cheap proxies; the
+Camoufox rig is built to get through.
+
 ## Configuration
 
 Environment variables, all optional:
