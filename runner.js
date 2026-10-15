@@ -255,6 +255,7 @@ const LANGS = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.9,de;q=0.7'];
 const rand = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
 const pick = (arr) => arr[rand(0, arr.length - 1)];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const { ensureTor } = require('./scripts/tor');
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, Number(n) || lo));
 
 /* ---------- proxy parsing ---------- */
@@ -273,6 +274,9 @@ function parseProxyLine(raw) {
   m = line.match(/^(?<host>[^:]+):(?<port>\d+):(?<user>[^:]+):(?<pass>.+)$/);
   if (m) return fmtProxy('http', m.groups.host, m.groups.port, m.groups.user, m.groups.pass);
 
+  m = line.match(/^(?<user>[^:@/]+):(?<pass>[^@/]+)@(?<host>[^:/]+):(?<port>\d+)$/);
+  if (m) return fmtProxy('http', m.groups.host, m.groups.port, m.groups.user, m.groups.pass);
+
   m = line.match(/^(?<host>[^:]+):(?<port>\d+)$/);
   if (m) return fmtProxy('http', m.groups.host, m.groups.port);
 
@@ -285,8 +289,11 @@ function parseProxyText(text) {
   for (const line of String(text || '').split(/\r?\n/)) {
     if (!line.trim() || line.trim().startsWith('#')) continue;
     const p = parseProxyLine(line);
-    if (p) out.push(p);
-    else bad.push(line.trim());
+    if (!p) bad.push(line.trim());
+    else if (/^socks/.test(p.server) && p.username) {
+      // Chromium cannot answer SOCKS5 username/password, so this line can never connect.
+      bad.push(`${line.trim()} (chromium cannot log in to SOCKS5 — use an http proxy with user:pass)`);
+    } else out.push(p);
   }
   return { proxies: out, bad };
 }
@@ -506,16 +513,39 @@ class Runner extends EventEmitter {
       ({ proxies, bad } = loadProxies(o.proxyFile));
     }
 
-    // Tor mode with no daemon is a guaranteed ten-way failure. Check first.
+    // Pasted text that yielded no usable proxy must not silently become Tor.
+    if (!proxies.length && String(opts.proxies || '').trim()) {
+      throw new Error(`no usable proxy in the box — ${bad.length} line(s) rejected, e.g. "${bad[0] || ''}". Use host:port, host:port:user:pass, user:pass@host:port or http://user:pass@host:port`);
+    }
+
+    // No proxies at all: run over Tor. Start a daemon ourselves when none is up.
     let torControlDown = false;
     if (!proxies.length) {
-      const socks = socksEndpoint(o.torSocks);
-      if (!(await probeTcp(socks.host, socks.port))) {
-        throw new Error(
-          `no proxies supplied and nothing is listening on ${o.torSocks} — start Tor (npm run tor) or paste proxies in the box`,
-        );
+      const tor = await ensureTor({
+        socksPort: Number(socksEndpoint(o.torSocks).port),
+        controlPort: o.torControlPort,
+        log: (m) => this.log('info', 'tor', m),
+      });
+      torControlDown = !tor.control;
+    }
+
+    // Pasted or file proxies: confirm each host:port answers before any browser
+    // launches, so a dead proxy is named once instead of failing every hit.
+    if (proxies.length) {
+      const endpoints = [...new Map(proxies.map((p) => {
+        const u = new URL(p.server);
+        return [`${u.hostname}:${u.port}`, { host: u.hostname, port: Number(u.port) }];
+      })).values()];
+      const results = await Promise.all(endpoints.map((e) => probeTcp(e.host, e.port).then((ok) => ({ ...e, ok }))));
+      const up = results.filter((r) => r.ok);
+      for (const r of results.filter((x) => !x.ok)) {
+        this.log('warn', 'boot', `proxy ${r.host}:${r.port} is not reachable — check the address or that the proxy is online`);
       }
-      torControlDown = !(await probeTcp(o.torControlHost, o.torControlPort));
+      if (!up.length) {
+        throw new Error(`none of the ${endpoints.length} proxy address(es) accept a connection — check host, port and that the proxy is online`);
+      }
+      const liveKeys = new Set(up.map((r) => `${r.host}:${r.port}`));
+      proxies = proxies.filter((p) => liveKeys.has(new URL(p.server).host));
     }
 
     const browsers = clamp(opts.browsers ?? o.browsers, 1, 8);

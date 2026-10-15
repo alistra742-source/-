@@ -152,12 +152,14 @@ async function main() {
   console.log('\nTor mode');
 
   // No daemon at all: refuse up front rather than launch ten browsers that cannot connect.
-  const appDown = await launchApp({ PROXY_FILE: emptyFile, ...fast });
+  // TOR_BIN points at a missing binary so this is deterministic: the runner tries to
+  // start Tor itself, finds none, and must refuse with the install fix.
+  const appDown = await launchApp({ PROXY_FILE: emptyFile, TOR_BIN: '/nonexistent/tor', ...fast });
   const refused = await post(appDown.port, '/api/start', { target: 'torcheck', browsers: 2, pages: 5 });
   const refusedBody = JSON.parse(refused.body);
   check('no daemon: run refused with 400', refused.status === 400, `${refused.status} ${refused.body.slice(0, 90)}`);
-  check('no daemon: message names the socks address and the fix',
-    /socks5:\/\/127\.0\.0\.1:9050/.test(refusedBody.error || '') && /npm run tor/.test(refusedBody.error || ''),
+  check('no daemon: message says tor is missing and offers the paste fix',
+    /tor binary is not installed/.test(refusedBody.error || '') && /paste proxies/.test(refusedBody.error || ''),
     refusedBody.error);
   check('no daemon: nothing was launched', !/"running":true/.test(refused.body));
   appDown.child.kill('SIGTERM');
@@ -225,6 +227,20 @@ async function main() {
   await sleep(600);
   fakeControl.close();
   fakeSocks.close();
+
+  // Pasted proxies that nothing answers: refused before any browser launches.
+  console.log('\nPasted proxies');
+  const deadApp = await launchApp({ PROXY_FILE: emptyFile, ...fast });
+  const dead = await post(deadApp.port, '/api/start', { target: 'deadproxy', proxies: '127.0.0.1:1' });
+  check('dead pasted proxy: refused with 400', dead.status === 400, `${dead.status} ${dead.body.slice(0, 90)}`);
+  check('dead pasted proxy: message names the reachability fault',
+    /accept a connection/.test(JSON.parse(dead.body).error || ''), dead.body.slice(0, 160));
+  // An unparseable paste must not silently become Tor.
+  const junk = await post(deadApp.port, '/api/start', { target: 'deadproxy', proxies: 'not a proxy at all' });
+  check('unparseable paste: refused, not routed to tor', junk.status === 400 && /no usable proxy/.test(JSON.parse(junk.body).error || ''),
+    junk.body.slice(0, 160));
+  deadApp.child.kill('SIGTERM');
+  await sleep(600);
 
   fs.unlinkSync(proxiesFile);
   fs.unlinkSync(emptyFile);
