@@ -139,6 +139,21 @@ async function main() {
   check('origin served the loads', sim.state.origin >= 2, `originRequests=${sim.state.origin}`);
   check('log stream delivered frames', frames.join('').includes('"type"'));
 
+  // Live cam: a worker that has run must expose a real JPEG; an unknown or malformed id must 404.
+  await sleep(2500);
+  // Raw bytes: the string-decoding request() helper would corrupt a JPEG.
+  const cam = await new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: '/api/frame/1.1' }, (res) => {
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    }).on('error', reject);
+  });
+  check('cam: frame served as jpeg', cam.status === 200 && /image\/jpeg/.test(cam.headers['content-type'] || '')
+    && cam.body.length > 0 && cam.body.slice(0, 2).equals(Buffer.from([0xff, 0xd8])), `status=${cam.status}`);
+  check('cam: unknown worker is 404', (await request(port, '/api/frame/9.9')).status === 404);
+  check('cam: malformed id is 404', (await request(port, '/api/frame/..%2Fetc')).status === 404);
+
   const stopped = await post(port, '/api/stop', {});
   check('stop reports not running', stopped.status === 200 && JSON.parse(stopped.body).status.running === false);
   sse.destroy();

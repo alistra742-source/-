@@ -328,7 +328,7 @@ function probeTcp(host, port, timeoutMs = 1500) {
 const DEFAULTS = {
   baseUrl: 'https://guns.lol',
   browsers: 2,
-  pages: 5,
+  pages: 3,
   headless: true,
   dwell: [9000, 22000],
   roundGap: [20000, 60000],
@@ -351,8 +351,14 @@ class Runner extends EventEmitter {
     this._clear();
   }
 
+  /* latest cam frame for a worker id like "1.2", or null */
+  frame(id) {
+    return this.frames.get(id) || null;
+  }
+
   _clear() {
     this.browsers = [];
+    this.frames = new Map();   // worker id -> { jpg, at }, the live cam
     this.workerHandles = [];
     this.stopping = false;
     this.running = false;
@@ -447,6 +453,7 @@ class Runner extends EventEmitter {
     for (;;) {
       if (this.stopping) return;
       let context;
+      let cam = null;
       try {
         const opts = {
           userAgent: pick(UAS),
@@ -466,6 +473,16 @@ class Runner extends EventEmitter {
 
         context = await browser.newContext(opts);
         const page = await context.newPage();
+        // Live cam: a small JPEG of this page every 2s, skipped while one is still in flight.
+        let shooting = false;
+        cam = setInterval(() => {
+          if (shooting || this.stopping) return;
+          shooting = true;
+          page.screenshot({ type: 'jpeg', quality: 55, scale: 'css', timeout: 5000 })
+            .then((jpg) => { if (!this.stopping) this.frames.set(id, { jpg, at: Date.now() }); })
+            .catch(() => {})
+            .finally(() => { shooting = false; });
+        }, 2000);
         await page.addInitScript(() => {
           Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
           Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
@@ -488,6 +505,7 @@ class Runner extends EventEmitter {
         this.log('miss', `p${id}`, `miss: ${this.lastError}`);
         this._emitState();
       } finally {
+        if (cam) clearInterval(cam);
         if (context) await context.close().catch(() => {});
       }
       await sleep(rand(gapLo, gapHi));

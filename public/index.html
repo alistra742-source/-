@@ -98,6 +98,11 @@
     </div>
   </section>
 
+  <section class="panel">
+    <h2>Live cam</h2>
+    <div id="cam" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px"></div>
+  </section>
+
   <section class="panel logwrap">
     <h2>Log</h2>
     <pre class="log" id="log"></pre>
@@ -123,9 +128,47 @@ function appendLog(entry) {
   if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 }
 
+let camKey = '';
+// Rebuild the grid only when the run's shape changes: one cell per browser x page.
+function renderCam(state) {
+  const key = state && state.running ? `${state.browsers}x${state.pages}` : '';
+  if (key === camKey) return;
+  camKey = key;
+  const cam = $('cam');
+  cam.innerHTML = '';
+  if (!key) { cam.textContent = 'cam offline — start a run'; cam.style.color = 'var(--dim)'; return; }
+  cam.style.color = '';
+  for (let b = 1; b <= state.browsers; b++) {
+    for (let p = 1; p <= state.pages; p++) {
+      const fig = document.createElement('figure');
+      fig.style.margin = '0';
+      const img = document.createElement('img');
+      img.id = `cam-${b}.${p}`;
+      img.alt = `browser ${b} page ${p}`;
+      img.style.cssText = 'width:100%;min-height:120px;border-radius:6px;background:#000;border:1px solid var(--line)';
+      img.onerror = () => { img.style.opacity = '0.25'; };
+      img.onload = () => { img.style.opacity = '1'; };
+      const cap = document.createElement('figcaption');
+      cap.textContent = `browser ${b} · page ${p}`;
+      cap.style.cssText = 'font:12px var(--mono);color:var(--dim);margin-top:4px';
+      fig.append(img, cap);
+      cam.append(fig);
+    }
+  }
+}
+
+// Refresh every cell's frame every 2s while a run is live.
+setInterval(() => {
+  if (!lastState || !lastState.running) return;
+  for (const img of document.querySelectorAll('#cam img')) {
+    img.src = `/api/frame/${img.id.slice(4)}?t=${Date.now()}`;
+  }
+}, 2000);
+
 function render(state) {
   if (!state) return;
   lastState = state;
+  renderCam(state);
   $('sHits').textContent = state.hits;
   $('sErrors').textContent = state.errors;
   $('sWorkers').textContent = state.running ? state.browsers * state.pages : 0;

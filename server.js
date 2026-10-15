@@ -130,6 +130,18 @@ async function handle(req, res) {
     return json(res, 200, { ok: true, status });
   }
 
+  // Live cam: the latest JPEG of one worker, id like "1.2" (browser.page).
+  if (route.startsWith('GET /api/frame/')) {
+    const id = url.pathname.slice('/api/frame/'.length);
+    const frame = /^\d+\.\d+$/.test(id) ? runner.frame(id) : null;
+    if (!frame) {
+      res.writeHead(404, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(JSON.stringify({ error: 'no frame' }));
+    }
+    res.writeHead(200, { 'content-type': 'image/jpeg', 'content-length': frame.jpg.length, 'cache-control': 'no-store' });
+    return res.end(frame.jpg);
+  }
+
   res.writeHead(404, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify({ error: 'not found' }));
 }
