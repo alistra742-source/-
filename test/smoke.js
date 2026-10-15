@@ -214,7 +214,7 @@ async function main() {
   // Which connection error chromium reports varies (proxy refused vs reset);
   // what matters is that it is a real connection failure, not a bad proxy option.
   check('navigation fails at the stand-in socks, as expected',
-    /ERR_(PROXY_)?CONNECTION_(RESET|FAILED|CLOSED)|ECONNREFUSED|ERR_PROXY/i.test(terr), terr);
+    /ERR_(PROXY_|SOCKS_)?CONNECTION_(RESET|FAILED|CLOSED)|ECONNREFUSED|ERR_PROXY|ERR_SOCKS/i.test(terr), terr);
   check('exit circuits rotated over the control port',
     controlSeen.includes('AUTHENTICATE') && controlSeen.includes('SIGNAL'), JSON.stringify(controlSeen.slice(0, 6)));
   check('boot log names the tor egress', /egress TOR socks5:\/\/127\.0\.0\.1:/.test(torFrames.join('')));
