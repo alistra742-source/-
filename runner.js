@@ -32,6 +32,11 @@ if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
   process.env.PLAYWRIGHT_BROWSERS_PATH = PROJECT_BROWSERS;
 }
 const PROJECT_LIBS_ROOT = path.join(__dirname, '.pwlibs');
+/* The stealth rig unpacks the same kind of dependency tree for Firefox into
+ * .foxlibs (see stealth/scripts/linux_deps.py). Both are project-local
+ * unpackings of the same shared objects, so one unpack serves both engines
+ * rather than forcing a second download for the same libraries. */
+const PROJECT_LIBS_ROOTS = [PROJECT_LIBS_ROOT, path.join(__dirname, '.foxlibs')];
 const BASE_LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH || '';
 
 /* Every directory under .pwlibs that actually holds shared objects. The layout
@@ -57,7 +62,9 @@ function collectLibDirs(root, maxDepth = 6) {
 /* Rebuildable so it can be re-run after libraries are installed at runtime. */
 function applyLibPath() {
   if (process.env.PLAYWRIGHT_SKIP_LOCAL_LIBS) return [];
-  const dirs = fs.existsSync(PROJECT_LIBS_ROOT) ? collectLibDirs(PROJECT_LIBS_ROOT) : [];
+  const dirs = PROJECT_LIBS_ROOTS
+    .filter((root) => fs.existsSync(root))
+    .flatMap((root) => collectLibDirs(root));
   const combined = [...dirs, BASE_LD_LIBRARY_PATH].filter(Boolean).join(':');
   if (combined) process.env.LD_LIBRARY_PATH = combined;
   else delete process.env.LD_LIBRARY_PATH;
@@ -66,6 +73,52 @@ function applyLibPath() {
 applyLibPath();
 
 const { chromium } = require('playwright');
+
+/*
+ * Fast loads.
+ *
+ * A view is mostly a page load, and most of that load is payload the view does
+ * not need: images, webfonts, media. Waiting for 'load' also waits on all of
+ * them, plus every tracking beacon. The classification that matters is what the
+ * *challenge* needs — scripts, XHR and stylesheets — so those are left alone and
+ * the rest is dropped, and navigation resolves at domcontentloaded.
+ *
+ * FAST=0 restores the old behaviour (full load, then networkidle). DROP
+ * chooses the resource types; WAIT_UNTIL overrides the navigation wait; the
+ * images bit of --blink-settings is added only when images are being dropped.
+ */
+const FAST = process.env.FAST !== '0';
+const DROP = (process.env.DROP || 'image,font,media').split(',').map((s) => s.trim()).filter(Boolean);
+const WAIT_UNTIL = process.env.WAIT_UNTIL || 'domcontentloaded';
+const IDLE_WAIT_MS = Number(process.env.IDLE_WAIT_MS || (FAST ? 0 : 12000));
+const LAUNCH_ARGS = [
+  '--disable-blink-features=AutomationControlled',
+  '--no-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints',
+  ...(FAST && DROP.includes('image') ? ['--blink-settings=imagesEnabled=false'] : []),
+];
+
+/* Aborted-request counter, shared by every worker and reported in the run
+ * status, so a run can prove the blocker actually fired. */
+const DROPPED = { count: 0 };
+
+/* Abort heavy resource types. Routing disables the HTTP cache, which costs
+ * nothing here: each worker loads one page per round. */
+async function installBlocker(page) {
+  if (!FAST || !DROP.length) return;
+  await page.route('**/*', (route) => {
+    if (DROP.includes(route.request().resourceType())) {
+      DROPPED.count++;
+      return route.abort().catch(() => {});
+    }
+    return route.continue().catch(() => {});
+  });
+}
 
 const chromiumExecutable = () => chromium.executablePath();
 
@@ -366,6 +419,8 @@ class Runner extends EventEmitter {
     this.errors = 0;
     this.startedAt = null;
     this.lastError = null;
+    this.loads = [];          // per-hit page load time, ms
+    DROPPED.count = 0;        // heavy requests aborted this run
     this.plan = null;
     this.torControlDown = false;
     this.torWarned = false;
@@ -386,6 +441,11 @@ class Runner extends EventEmitter {
       startedAt: this.startedAt,
       uptime: this.startedAt ? Date.now() - this.startedAt : 0,
       lastError: this.lastError,
+      fast: FAST,
+      drop: DROP,
+      waitUntil: WAIT_UNTIL,
+      droppedRequests: DROPPED.count,
+      loadMsMedian: median(this.loads),
     };
   }
 
@@ -489,13 +549,18 @@ class Runner extends EventEmitter {
           window.chrome = window.chrome || { runtime: {} };
         });
 
-        await page.goto(this.plan.url, { waitUntil: 'load', timeout: this.plan.navTimeout });
-        await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+        await installBlocker(page);
+        const t0 = Date.now();
+        const resp = await page.goto(this.plan.url, { waitUntil: WAIT_UNTIL, timeout: this.plan.navTimeout });
+        if (IDLE_WAIT_MS) await page.waitForLoadState('networkidle', { timeout: IDLE_WAIT_MS }).catch(() => {});
+        const loadMs = Date.now() - t0;
+        this.loads.push(loadMs);
         await this._dwell(page);
 
         if (this.stopping) return;
         this.hits++;
-        this.log('hit', `p${id}${proxy ? ' ' + proxy.label : ' tor'}`, 'view sent');
+        this.log('hit', `p${id}${proxy ? ' ' + proxy.label : ' tor'}`,
+          `view sent (${resp ? resp.status() : 'no response'} in ${loadMs}ms, ${DROPPED.count} heavy request(s) dropped)`);
         this.emit('hit', { worker: id, proxy: proxy ? proxy.label : 'tor', hits: this.hits });
         this._emitState();
       } catch (e) {
@@ -602,10 +667,7 @@ class Runner extends EventEmitter {
     let slot = 0;
     try {
       for (let b = 0; b < browsers; b++) {
-        const browser = await chromium.launch({
-          headless,
-          args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
-        });
+        const browser = await chromium.launch({ headless, args: LAUNCH_ARGS });
         if (this.stopping) { await browser.close().catch(() => {}); break; }
         this.browsers.push(browser);
         for (let p = 0; p < pages; p++) {
@@ -650,7 +712,15 @@ class Runner extends EventEmitter {
   }
 }
 
+/* Median load time, so one slow outlier does not read as the run's speed. */
+function median(values) {
+  if (!values || !values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return Math.round(sorted[Math.floor(sorted.length / 2)]);
+}
+
 module.exports = {
   Runner, parseProxyLine, parseProxyText, loadProxies,
   ensureChromium, ensureChromiumDeps, chromiumExecutable, PROJECT_BROWSERS,
+  median, FAST, DROP, WAIT_UNTIL, LAUNCH_ARGS, DROPPED, applyLibPath, PROJECT_LIBS_ROOTS,
 };

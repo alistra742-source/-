@@ -15,13 +15,18 @@ walks Cloudflare Turnstile the way a real Firefox does.
 Everything is importable from the top level for convenience.
 """
 
+from .captcha import (CaptchaError, CaptchaProvider, ClearanceRequest, ClearanceResult,
+                      TurnstileRequest, build_provider)
+from .chromium import ChromiumFleet, ChromiumSession, ensure_host_env
+from .cloudflare import CloudflareGuard
 from .config import StealthConfig, Proxy, parse_proxy_line, parse_proxy_text
 from .egress import ClearanceBroker, EgressPool, EgressStat
 from .fingerprint import FingerprintFactory
+from .guns import (Challenge, GunsClient, GunsRunner, PowSolver, ViewAttempt,
+                   parse_challenge, view_payload)
 from .human import HumanBehavior
-from .tls import TLSFetch, IMPERSONATION_TARGETS
-from .cloudflare import CloudflareGuard
 from .session import StealthSession, StealthFleet
+from .tls import TLSFetch, IMPERSONATION_TARGETS
 
 __all__ = [
     "StealthConfig",
@@ -38,6 +43,25 @@ __all__ = [
     "CloudflareGuard",
     "StealthSession",
     "StealthFleet",
+    # fast Chromium engine
+    "ChromiumSession",
+    "ChromiumFleet",
+    "ensure_host_env",
+    # native guns.lol protocol
+    "GunsClient",
+    "GunsRunner",
+    "PowSolver",
+    "Challenge",
+    "ViewAttempt",
+    "parse_challenge",
+    "view_payload",
+    # captcha services
+    "CaptchaProvider",
+    "CaptchaError",
+    "TurnstileRequest",
+    "ClearanceRequest",
+    "ClearanceResult",
+    "build_provider",
 ]
 
 __version__ = "1.0.0"

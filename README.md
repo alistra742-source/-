@@ -55,26 +55,48 @@ may be missing too. `npm run deps` installs them: with root it runs
 them into `.pwlibs/`. Either way it re-runs the real binary before reporting
 success.
 
-## Stealth engine (Camoufox)
+## Three engines
 
-Beside this Chromium runner there is a higher-stealth engine in `stealth/` — a
-patched Firefox (Camoufox) driven by Python, with a coherent fingerprint, a
-recorded-motion humanizer, TLS/JA3 impersonation on the fast HTTP path, and a
-Cloudflare Turnstile handler. Same proxy grammar and CLI ergonomics.
+This Chromium runner is the volume rail: N browsers, many contexts, per-context
+proxy. The Python rig in `stealth/` adds two more, and one of them does not load
+a page at all.
 
 ```bash
 pip install -r stealth/requirements.txt
-camoufox fetch
-python -m stealth <username> --contexts 2 --proxy-file proxies.txt
-python stealth/scripts/check_rig.py   # offline fleet/egress checks, no browser
+eval "$(python stealth/scripts/linux_deps.py --print-env)"   # rootless libs + fonts
+
+python -m stealth <username> --contexts 2 --proxy-file proxies.txt          # camoufox (default)
+python -m stealth <username> --engine chromium --contexts 4                  # fast chromium
+python -m stealth <username> --engine guns --count 20 --concurrency 4       # native protocol
+python stealth/scripts/check_rig.py                                          # 101 offline checks
 ```
+
+| engine | what it is | when |
+|---|---|---|
+| `camoufox` | patched Firefox, coherent fingerprint, recorded-motion humanizer, TLS/JA3 impersonation, Turnstile handler | the site fights back |
+| `chromium` | one browser, many contexts (Chromium is the only engine with per-context proxies), images/fonts/media aborted, `domcontentloaded` | volume through cheap proxies |
+| `guns` | the native guns.lol protocol: scrapes `_gpp_ch`, solves its rotating WASM proof-of-work in `node`, posts the signed view | no browser, one view at a time |
+
+Measured on the live target from a 4-core box: Chromium loads the profile in
+**1.7 s** with heavy resources dropped vs 1.9 s full, and a view through
+`--engine guns` costs **~3.7 s with no browser at all** (page 0.5 s, module
+0.9 s, proof-of-work 0.9–5 s, POST 0.2 s).
 
 Workers that share a proxy (or run with none) share one Cloudflare clearance
 instead of each solving the same challenge on the same IP, and their egress
-outcomes are remembered between runs — see [STEALTH.md](STEALTH.md) for the
-install (including the Linux GTK runtime), the architecture, the checks, and the
-honest limits. The Chromium runner is built for volume through cheap proxies; the
-Camoufox rig is built to get through.
+outcomes are remembered between runs. A `{session}` placeholder in a proxy's
+credentials is re-rendered **per view**, so one rotating proxy line is a fresh
+IP per view — the site counts about one view per IP per day.
+
+One thing is worth knowing before you run `--engine guns`: Cloudflare's Managed
+Challenge sits on the analytics POST itself, not on the profile page, so a view
+needs a Turnstile token and a clearance minted **for that path** — from a captcha
+service (`--captcha-provider capmonster|solverify|uncaptcha --captcha-key …`) or
+handed in (`--turnstile-token`, `--cf-clearance`). Without one the run says so
+and refuses, rather than reporting a view that never counted.
+
+See [STEALTH.md](STEALTH.md) for the install (including the Linux GTK/font
+runtime), the architecture, all 101 checks, and the honest limits.
 
 ## Configuration
 
@@ -89,7 +111,16 @@ Environment variables, all optional:
 - `TOR_SOCKS` / `TOR_PORT` / `TOR_PASSWORD` — default `socks5://127.0.0.1:9050`, `9051`, unset
 - `TOR_SOCKS_PORT` — port `npm run tor` should listen on, default `9050`
 - `PLAYWRIGHT_BROWSERS_PATH` — overrides the pinned browser cache
-- `PLAYWRIGHT_SKIP_LOCAL_LIBS` — ignore `.pwlibs`
+- `PLAYWRIGHT_SKIP_LOCAL_LIBS` — ignore `.pwlibs` and `.foxlibs`
+- `FAST` / `DROP` / `WAIT_UNTIL` / `IDLE_WAIT_MS` — this runner's fast-load
+  controls. `FAST=0` restores the old full load; `DROP=image,font,media` chooses
+  what to abort; `WAIT_UNTIL` picks the navigation wait; `IDLE_WAIT_MS` adds a
+  bounded `networkidle` wait on top (0 by default when `FAST`)
+- `STEALTH_ENGINE` — default engine for `python -m stealth` (`camoufox`)
+- `CAPTCHA_PROVIDER` / `CAPTCHA_KEY` — keep a captcha key out of the command
+  line for `--engine guns`
+- `STATE_DIR` — where the Python rig keeps clearances, PoW modules and fonts
+  (default `.stealth-state`)
 
 ## If something breaks
 

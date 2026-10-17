@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Optional
 
+from .chromium import ChromiumFleet
 from .config import OS_TARGETS, StealthConfig, parse_proxy_text
 from .session import StealthFleet
 
@@ -77,6 +78,39 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds to wait for a sibling worker's solve on the same egress")
     p.add_argument("--debug-config", action="store_true",
                    help="print the Camoufox config sent to the browser (leak check)")
+
+    eng = p.add_argument_group("engines")
+    eng.add_argument("--engine", choices=("camoufox", "chromium", "guns"),
+                     default=os.environ.get("STEALTH_ENGINE", "camoufox"),
+                     help="camoufox = stealth rig (default); chromium = fast Chromium "
+                          "fleet, one browser many contexts; guns = the native guns.lol "
+                          "protocol, no page load at all")
+    eng.add_argument("--no-fast", action="store_true",
+                     help="chromium: load the full page (stylesheets, images, fonts) "
+                          "and wait for 'load' instead of dropping heavy resources")
+    eng.add_argument("--drop", default="image,font,media",
+                     help="chromium: resource types to abort (default image,font,media)")
+    eng.add_argument("--wait-until", default="domcontentloaded",
+                     choices=("domcontentloaded", "load", "commit"),
+                     help="chromium: navigation wait (default domcontentloaded)")
+    eng.add_argument("--idle-wait", type=int, default=0,
+                     help="chromium: also wait up to N ms for networkidle (default 0)")
+
+    guns = p.add_argument_group("native guns.lol protocol (--engine guns)")
+    guns.add_argument("--count", type=int, default=1, help="views to record (default 1)")
+    guns.add_argument("--concurrency", type=int, default=4,
+                      help="views recorded at once (default 4)")
+    guns.add_argument("--device", choices=("desktop", "mobile", "tablet"), default="desktop",
+                      help="device enum sent with the view")
+    guns.add_argument("--captcha-provider", default=os.environ.get("CAPTCHA_PROVIDER", ""),
+                      help="capmonster | solverify | uncaptcha — mints the Turnstile "
+                           "token and the cf_clearance the analytics POST needs")
+    guns.add_argument("--captcha-key", default=os.environ.get("CAPTCHA_KEY", ""),
+                      help="API key for the captcha provider")
+    guns.add_argument("--cf-clearance", default="",
+                      help="a cf_clearance minted elsewhere (skips the provider's clearance task)")
+    guns.add_argument("--turnstile-token", default="",
+                      help="a Turnstile token minted elsewhere (skips the provider's token task)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -117,6 +151,18 @@ def config_from_args(args: argparse.Namespace) -> StealthConfig:
         launch_retries=max(0, args.launch_retries),
         share_clearance=not args.no_share_clearance,
         clearance_wait_s=float(args.clearance_wait),
+        engine=args.engine,
+        fast_browser=not args.no_fast,
+        drop_resources=tuple(x.strip() for x in str(args.drop).split(",") if x.strip()),
+        wait_until=args.wait_until,
+        idle_wait_ms=max(0, args.idle_wait),
+        view_count=max(1, args.count),
+        view_concurrency=max(1, args.concurrency),
+        device=args.device,
+        captcha_provider=args.captcha_provider,
+        captcha_key=args.captcha_key,
+        cf_clearance=args.cf_clearance,
+        turnstile_token=args.turnstile_token,
         debug_config=args.debug_config,
         verbose=args.verbose,
     )
@@ -139,7 +185,11 @@ async def _run(args: argparse.Namespace) -> int:
         up = f"{(time.time() - started):5.0f}s"
         print(f"[{up}][{tag}] {msg}", flush=True)
 
-    fleet = StealthFleet(cfg, log=log)
+    if cfg.engine == "guns":
+        return await _run_guns(cfg, args, log)
+
+    fleet = ChromiumFleet(cfg, fast=cfg.fast_browser, log=log) if cfg.engine == "chromium" \
+        else StealthFleet(cfg, log=log)
     try:
         status = await fleet.run(rounds=max(1, args.rounds))
     except KeyboardInterrupt:
@@ -151,6 +201,11 @@ async def _run(args: argparse.Namespace) -> int:
         return 3
 
     log("done", f"hits={status['hits']} misses={status['misses']} mode={status['mode']}")
+    if status.get("load_ms_median"):
+        log("speed", f"median page load {status['load_ms_median']:.0f}ms "
+                     f"(min {status['load_ms_min']:.0f}ms)"
+                     + (f" · aborted {sum(status['blocked'].values())} heavy request(s)"
+                        if status.get("blocked") else ""))
     for row in status.get("egress") or []:
         log(
             "egress",
@@ -158,6 +213,57 @@ async def _run(args: argparse.Namespace) -> int:
             f"solves={row['solves']} reused={row['reused']} blocks={row['blocks']}",
         )
     return 0
+
+
+async def _run_guns(cfg: StealthConfig, args: argparse.Namespace, log) -> int:
+    """Record views over the native guns.lol protocol — no page load per view."""
+    from .guns import GunsRunner
+    from .captcha import CaptchaError, build_provider
+
+    provider = None
+    if cfg.captcha_provider:
+        try:
+            provider = build_provider(cfg.captcha_provider, cfg.captcha_key, log=log)
+        except CaptchaError as e:
+            log("error", str(e))
+            return 2
+        log("guns", f"captcha provider: {provider.name}")
+    elif not cfg.turnstile_token:
+        # Say it up front: the POST path is Cloudflare-gated, and without a token
+        # and a clearance the run can only report the block, never a view.
+        log("warn", "no --captcha-provider and no --turnstile-token: the analytics POST "
+                    "is behind a Cloudflare Managed Challenge, so views will be refused")
+
+    tokens = None  # type: ignore[assignment]
+    if cfg.turnstile_token or cfg.cf_clearance:
+        cookies = {"cf_clearance": cfg.cf_clearance} if cfg.cf_clearance else {}
+        tokens = {i: {"token": cfg.turnstile_token, "cookies": cookies} for i in range(cfg.view_count)}
+
+    proxies, bad = cfg.resolved_proxies()
+    for line in bad:
+        log("warn", f"proxy rejected: {line}")
+    if proxies and not any(p.rotating for p in proxies):
+        log("warn", f"none of the {len(proxies)} proxy line(s) contain "
+                     f"{'{session}'} — every view will egress on the same IP, and the "
+                     f"site counts about one view per IP per day")
+
+    runner = GunsRunner(cfg.target.strip().strip("/"), state_dir=cfg.state_dir,
+                        proxies=proxies, tokens=tokens, provider=provider,
+                        device=cfg.device, log=log)
+    try:
+        status = await runner.run(count=cfg.view_count, concurrency=cfg.view_concurrency)
+    except KeyboardInterrupt:
+        log("stop", "interrupted")
+        return 130
+    except Exception as e:
+        log("error", str(e).splitlines()[0])
+        return 3
+    if provider is not None:
+        await provider.close()
+
+    log("done", f"ok={status['ok']} failed={status['failed']}"
+                + (f" stages={status['stages']}" if status["stages"] else ""))
+    return 0 if status["failed"] == 0 else 1
 
 
 def main(argv: Optional[list] = None) -> int:

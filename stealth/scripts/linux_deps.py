@@ -108,6 +108,22 @@ def main() -> int:
         base = os.environ.get("LD_LIBRARY_PATH", "")
         joined = ":".join(dirs + ([base] if base else []))
         print(f'export LD_LIBRARY_PATH="{joined}"')
+        # Same unpack, second half of the story: Chromium needs a fontconfig
+        # that resolves, or its Skia font manager aborts the whole browser the
+        # first time a page renders text. The font tree is already here.
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))
+        try:
+            from stealth.chromium import ensure_fontconfig
+
+            conf = ensure_fontconfig(PROJECT_ROOT)
+            if conf:
+                print(f'export FONTCONFIG_FILE="{conf}"')
+                fc_path = LIBS_ROOT / "etc" / "fonts"
+                if fc_path.exists():
+                    print(f'export FONTCONFIG_PATH="{fc_path}"')
+        except Exception as e:  # pragma: no cover - keep the library export usable
+            print(f"# fontconfig not set up: {e}", file=sys.stderr)
         return 0
 
     if not _has("apt-get") or not _has("dpkg-deb"):

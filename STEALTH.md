@@ -1,11 +1,20 @@
-# stealth/ — the Camoufox rig
+# stealth/ — the Python rig: stealth, speed and the native protocol
 
-An insane-stealth browser engine that sits beside the Chromium runner in
-`runner.js`. The Chromium runner is built for volume through cheap proxies; this
-one is built to get *through* — past Cloudflare, past JS fingerprinting, past
-the behavioural checks that flag stock automation.
+Three engines share one CLI, because a guns.lol view has three different costs
+depending on what the site is doing to you:
 
-Four layers per browser, stacked, plus the glue that runs many of them:
+* **`--engine camoufox`** (default) — the stealth rig, built to get *through*:
+past Cloudflare, past JS fingerprinting, past the behavioural checks that flag
+stock automation.
+* **`--engine chromium`** — a fast Chromium fleet: one browser, many contexts,
+heavy resources aborted. Built for volume.
+* **`--engine guns`** — the native guns.lol protocol: challenge, WASM
+proof-of-work, signed POST. No page load, no browser, per view.
+
+Details of the last two are in [Three engines, one CLI](#three-engines-one-cli);
+the rest of this document is the stealth rig.
+
+Four layers per Camoufox browser, stacked, plus the glue that runs many of them:
 
 | layer | module | what it does |
 |---|---|---|
@@ -165,13 +174,129 @@ The fleet and egress layers have offline checks — no browser, no network, no
 proxies:
 
 ```bash
-python stealth/scripts/check_rig.py
+python stealth/scripts/check_rig.py     # 101 checks, exits non-zero on failure
 ```
 
 They drive the real broker from real child processes (including killing a holder
 mid-solve) and the real guard against a scripted page, so the coordination claims
-above are verified rather than asserted. The live engine still needs the browser:
-run `python -m stealth <user> --contexts 1` for that path.
+above are verified rather than asserted. Sections H–L (in `check_rig_extra.py`)
+cover the fast rails described below, with fixtures captured from the live site:
+a real `_gpp_ch` object, a real worker module. The live engine still needs the
+browser: run `python -m stealth <user> --contexts 1` for that path.
+
+## Three engines, one CLI
+
+`python -m stealth <user> --engine …`
+
+| engine | what it is | when |
+|---|---|---|
+| `camoufox` (default) | the stealth rig above, one Firefox per worker | the site fights back and you need to get through |
+| `chromium` | a fast Chromium fleet: **one browser, many contexts**, heavy resources aborted | volume — many egresses, few launches |
+| `guns` | the native guns.lol protocol: no page load, no browser, per view | the view is the goal and you have tokens |
+
+### chromium — the volume rail
+
+```bash
+python -m stealth <user> --engine chromium --contexts 4
+python -m stealth <user> --engine chromium --no-fast        # full load, for comparison
+```
+
+Two things make it fast, and both are measured rather than assumed. A view is
+mostly a page load, and most of that load is payload a view cannot use, so
+images, webfonts and media are aborted (scripts, XHR and stylesheets are left
+alone — the challenge needs those), and navigation resolves at
+`domcontentloaded` instead of `load` plus `networkidle`. On the live target from
+this box that is **1.7 s vs 1.9 s** per load — the honest number is small,
+because this page is only 4–5 heavy requests, and the win grows with the
+payload. The bigger win is structural: Chromium accepts a **per-context proxy**,
+which Firefox does not, so four egresses cost **one browser launch** instead of
+four. Four workers, one browser, one round: ~10 s wall, ~2.5 s/view amortised,
+versus a browser launch each.
+
+### Headless Chromium needs a fontconfig (or it aborts)
+
+On a slim host Chromium's Skia font manager kills the whole browser the first
+time a page renders text:
+
+    FATAL:third_party/skia/src/ports/SkFontMgr_FontConfigInterface.cpp:163] Not implemented.
+
+That looks exactly like "Cloudflare killed my browser" and is not — it happens on
+any text-heavy page. `stealth/chromium.py:ensure_host_env()` pins the browser
+cache, puts the locally unpacked shared objects on the loader path, and points
+`FONTCONFIG_FILE` at a generated config naming the DejaVu tree inside
+`.foxlibs`. The same three exports come out of the dependency helper:
+
+```bash
+eval "$(python stealth/scripts/linux_deps.py --print-env)"
+```
+
+### guns — the native protocol, no page load
+
+A guns.lol view is not a page load. The profile carries a `_gpp_ch` challenge;
+the challenge id names a WASM proof-of-work module under `/_challenge/pow/<id>/`;
+and the view is a signed POST to `/api/analytics/view`. `stealth/guns.py` does
+all three without a browser, and it *solves the real module*: guns.lol rotates
+the worker, the wasm-bindgen glue and the hashed export names, so the worker's
+obfuscated glue import is decoded, the glue is parsed for the binary and the
+rotated constructor/solve exports, and the binary is driven in `node` by
+`stealth/powjs/runner.mjs`. The module is cached by challenge id.
+
+```bash
+python -m stealth <user> --engine guns --count 20 --concurrency 4
+```
+
+Measured live: page fetch 0.5 s, module fetch 0.9 s (cache hit after the first
+view), proof-of-work 0.9–5 s at difficulty 5, POST 0.2 s — **a view in ~3.7 s
+with no browser at all**, and it fails with the stage it failed *in*
+(`page`/`module`/`pow`/`post`) instead of a bare "miss".
+
+### The one thing that cannot be computed: the POST's Cloudflare gate
+
+Cloudflare's Managed Challenge sits on `/api/analytics/view` itself, **not** on
+the profile page. This is measured, not inferred: the page serves 200 to a plain
+client, and the very next POST is answered with `403` +
+`cf-mitigated: challenge` — from curl_cffi, and from the page's own `fetch`, and
+from the browser's request context, with a valid `cf_clearance` present. Clearing
+the page does not clear the endpoint.
+
+So a view needs two artifacts from a captcha service (or handed in):
+
+| field | what it is | why it cannot be local |
+|---|---|---|
+| `cf_clearance` (for the POST path) | a clearance minted for `/api/analytics/view` | Cloudflare only issues it when it actually challenges; it is bound to the exit IP **and** User-Agent |
+| Turnstile token | the widget's response token | it is the widget's signature; single-use, per view |
+
+```bash
+python -m stealth <user> --engine guns --count 20 --concurrency 4 \
+  --captcha-provider capmonster --captcha-key $CAPTCHA_KEY
+
+# tokens minted elsewhere (a browser extension, a different service):
+python -m stealth <user> --engine guns --turnstile-token <tok> --cf-clearance <cookie>
+```
+
+Three providers are wired, each with its own task shape and its own documented
+quirks: `capmonster` (replays the captured interstitial, solves with the UA it is
+handed), `solverify` (drives the challenged URL itself, http proxies only,
+returns a cookie **jar** plus the UA you must then present) and `uncaptcha`
+(single call, `X-Api-Key`, `waf` task). The clearance is cached **per egress**,
+so a provider is paid once per egress, not once per view; the Turnstile token is
+asked for per view, after the challenge is known, because the widget's `action`
+and `data-cdata` come from `_gpp_ch`.
+
+Set `CAPTCHA_PROVIDER` / `CAPTCHA_KEY` to keep the key out of the command line.
+
+### Rotating proxies
+
+A `{session}` placeholder in a proxy's credentials is re-rendered **per view**, so
+one proxy line becomes a fresh exit IP per view — the site counts roughly one
+view per IP per day, so without it the fleet's second view is wasted. Each
+rendered session also gets its own clearance cache key, because a clearance is
+bound to the IP that solved it and replaying one across two IPs gets it revoked:
+
+```bash
+python -m stealth <user> --engine guns --count 40 \
+  --proxies 'http://user:pass_session-{session}_lifetime-30s@geo.iproyal.com:12345'
+```
 
 ## What each layer actually does
 
@@ -219,6 +344,16 @@ the exit IP — reuse across a different IP is the fastest way to get it revoked
   (a few hundred MB, on top of a 1.3 GB install), so ~2 workers on a 4-core/8 GB
   box is the honest number. More workers need more memory; on a small host use
   `--contexts 1`, or plan the fleet for the machine you actually have.
+- `--engine guns` was verified **up to** the Cloudflare gate: challenge scrape,
+  module fetch, rotation parsing, native proof-of-work and the POST are all
+  exercised live, and the POST is refused with an honest stage (`post`). The
+  provider-backed path (`--captcha-provider …`) is verified against a local stub
+  for every request shape, error path and timeout (checks J1–J19) — it was **not**
+  run against a live provider, because no key was available. Treat the first live
+  run as the acceptance test for that half.
+- The proof-of-work is CPU work: ~1–5 s per view at difficulty 5 on one core.
+  Concurrency multiplies it, which is why the native engine is measured in views
+  per second per core, not per page load.
 
 ## Pyright/type note
 

@@ -12,6 +12,13 @@ Covers the fleet and egress layers, where the subtle bugs live:
     E  EgressPool prefers warm egresses, sinks blockers, persists, and cycles
     F  worker RESULT lines fold into the run totals and the pool
     G  a browser that never launches costs a relaunch, not a worker slot
+    H  the native guns.lol protocol: challenge, payload, headers, block detection
+    I  the PoW harness and its cache, driven by a worker captured from the site
+    J  captcha providers against a local stub: success, refusal, timeout
+    K  the Chromium engine's font/bootstrap fix and resource blocking
+    L  rotating proxies: a fresh session per view, a per-session clearance key
+
+H-L live in `check_rig_extra.py`; they still need no browser and no network.
 
 An engine check still needs the browser: run
 `python -m stealth <user> --contexts 1` for the live path.
@@ -514,10 +521,20 @@ def check_worker_retry(tmp: str) -> None:
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="rig-check-")
     print(f"stealth rig checks — state under {tmp}")
+    from check_rig_extra import (check_captcha, check_chromium_env, check_guns_protocol,
+                                 check_pow_harness, check_proxy_session)
+
+    # The suites in check_rig_extra take the reporter as an argument so they can
+    # be imported without importing this module's globals back.
+    suites = [(fn, ()) for fn in (check_broker, check_guard, check_pool, check_fleet,
+                                  check_worker_retry)]
+    suites += [(fn, (check,)) for fn in (check_guns_protocol, check_pow_harness,
+                                         check_captcha, check_chromium_env,
+                                         check_proxy_session)]
     try:
-        for fn in (check_broker, check_guard, check_pool, check_fleet, check_worker_retry):
+        for fn, extra in suites:
             try:
-                fn(tmp)
+                fn(tmp, *extra)
             except Exception:
                 FAILURES.append(f"{fn.__name__} raised")
                 print(f"  [FAIL] {fn.__name__} raised:")

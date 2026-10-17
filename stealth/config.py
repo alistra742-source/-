@@ -21,6 +21,21 @@ from typing import List, Optional, Tuple
 OS_TARGETS = ("windows", "macos", "linux")
 
 
+# Rotating proxy providers key the sticky session (and therefore the exit IP)
+# off a token in the credentials — IPRoyal's `password_session-<id>_lifetime-30s`
+# is the common shape. One placeholder, resolved per view, is what turns a
+# single proxy line into a fresh IP per view, which is the whole difference
+# between forty views and forty views on one IP.
+SESSION_PLACEHOLDER = "{session}"
+
+
+def new_session_id() -> str:
+    """A 16-hex-character token for use as a proxy session id."""
+    import secrets
+
+    return secrets.token_hex(8)
+
+
 @dataclass
 class Proxy:
     """One usable egress endpoint in Playwright's dict shape."""
@@ -28,6 +43,26 @@ class Proxy:
     server: str
     username: Optional[str] = None
     password: Optional[str] = None
+
+    @property
+    def rotating(self) -> bool:
+        """Whether this proxy hands out a new IP per rendered session."""
+        return SESSION_PLACEHOLDER in f"{self.username or ''}{self.password or ''}"
+
+    def render(self, session_id: Optional[str] = None) -> "Proxy":
+        """Resolve the `{session}` placeholder, if present, to a fresh token.
+
+        Returns self when the proxy does not rotate, so callers can render
+        unconditionally without paying for a token they will not use.
+        """
+        if not self.rotating:
+            return self
+        token = session_id or new_session_id()
+        return Proxy(
+            server=self.server,
+            username=(self.username or "").replace(SESSION_PLACEHOLDER, token) or None,
+            password=(self.password or "").replace(SESSION_PLACEHOLDER, token) or None,
+        )
 
     @property
     def label(self) -> str:
@@ -39,21 +74,23 @@ class Proxy:
         except Exception:  # pragma: no cover - defensive
             return self.server
 
-    def to_playwright(self) -> dict:
+    def to_playwright(self, session_id: Optional[str] = None) -> dict:
         """The exact dict Playwright/Camoufox wants for `proxy=`."""
-        out = {"server": self.server}
-        if self.username:
-            out["username"] = self.username
-        if self.password:
-            out["password"] = self.password
+        rendered = self.render(session_id)
+        out = {"server": rendered.server}
+        if rendered.username:
+            out["username"] = rendered.username
+        if rendered.password:
+            out["password"] = rendered.password
         return out
 
-    def to_curl(self) -> str:
+    def to_curl(self, session_id: Optional[str] = None) -> str:
         """A single proxy URL for curl_cffi's `proxies=` argument."""
-        if self.username and self.password:
-            scheme, _, rest = self.server.partition("://")
-            return f"{scheme}://{self.username}:{self.password}@{rest}"
-        return self.server
+        rendered = self.render(session_id)
+        if rendered.username and rendered.password:
+            scheme, _, rest = rendered.server.partition("://")
+            return f"{scheme}://{rendered.username}:{rendered.password}@{rest}"
+        return rendered.server
 
 
 def _fmt(scheme: str, host: str, port: str, user: Optional[str], pw: Optional[str]) -> Proxy:
@@ -180,6 +217,26 @@ class StealthConfig:
     share_clearance: bool = True
     clearance_wait_s: float = 30.0   # how long to wait for a peer's clearance
 
+    # which engine drives the run: the Camoufox rig (stealth), a fast Chromium
+    # fleet (volume), or the native guns.lol protocol (no page load at all)
+    engine: str = "camoufox"
+
+    # fast-load tuning for the Chromium engine. `load` and `networkidle` wait on
+    # fonts, images and beacons that cannot change whether a view counts.
+    fast_browser: bool = True
+    drop_resources: Tuple[str, ...] = ("image", "font", "media")
+    wait_until: str = "domcontentloaded"
+    idle_wait_ms: int = 0
+
+    # native guns.lol protocol (engine="guns")
+    view_count: int = 1
+    view_concurrency: int = 4
+    device: str = "desktop"
+    captcha_provider: str = ""
+    captcha_key: str = ""
+    cf_clearance: str = ""      # a clearance minted elsewhere
+    turnstile_token: str = ""    # a token minted elsewhere
+
     # debugging
     debug_config: bool = False
     verbose: bool = False
@@ -207,3 +264,7 @@ class StealthConfig:
             raise ValueError("target has invalid characters")
         if self.os_target and self.os_target not in OS_TARGETS:
             raise ValueError(f"os_target must be one of {OS_TARGETS}")
+        if self.engine not in ("camoufox", "chromium", "guns"):
+            raise ValueError("engine must be one of camoufox, chromium, guns")
+        if self.device not in ("desktop", "mobile", "tablet"):
+            raise ValueError("device must be one of desktop, mobile, tablet")
