@@ -244,6 +244,31 @@ def is_view_beacon(url: str, method: str = "POST", status: int = 0) -> bool:
             and 200 <= int(status) < 300)
 
 
+# Why a view did or did not count. Measured on the live target: the page's own
+# POST to /api/analytics/view comes back `cf-mitigated: challenge` — Cloudflare
+# guards that path separately from the page, even with the page's own
+# cf_clearance in the jar. Naming the three outcomes separately is the whole
+# point: "no view" and "Cloudflare refused the view" need different fixes.
+def classify_view(status: Optional[int], mitigated: str = "") -> str:
+    """Map one view POST's response onto counted / challenged / rejected / none."""
+    if status is None:
+        return "none"
+    if 200 <= int(status) < 300:
+        return "counted"
+    if int(status) == 403 and (mitigated or "").strip().lower() == "challenge":
+        return "challenged"
+    return "rejected"
+
+
+def turnstile_params_from(values: Dict[str, Any]) -> Dict[str, str]:
+    """Normalise the widget attributes a provider needs into one shape."""
+    return {
+        "sitekey": str(values.get("sitekey") or ""),
+        "action": str(values.get("action") or ""),
+        "cdata": str(values.get("cdata") or ""),
+    }
+
+
 @dataclass
 class LoadReport:
     """What one fast page load cost, and whether it recorded a view."""
@@ -257,6 +282,8 @@ class LoadReport:
     challenge_ms: float = 0.0
     title: str = ""
     beacon_status: Optional[int] = None
+    view_status: Optional[int] = None
+    view_mitigated: str = ""
 
     @property
     def view_recorded(self) -> bool:
@@ -267,7 +294,8 @@ class LoadReport:
         return {"url": self.url, "status": self.status, "ms": round(self.ms, 1),
                 "cleared": self.cleared, "blocked": dict(self.blocked),
                 "challenge_ms": round(self.challenge_ms, 1), "title": self.title,
-                "beacon_status": self.beacon_status, "view_recorded": self.view_recorded,
+                "beacon_status": self.beacon_status, "view_status": self.view_status,
+                "view_mitigated": self.view_mitigated, "view_recorded": self.view_recorded,
                 "detail": self.detail}
 
 
@@ -304,6 +332,8 @@ class ChromiumSession:
         # Every response to the site's analytics endpoints, in order. This is the
         # only evidence that a view counted; a 200 on the page is not.
         self.beacons: List[Tuple[int, str]] = []
+        # POSTs to the view endpoint with the headers that explain a refusal.
+        self.view_posts: List[Dict[str, Any]] = []
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -354,8 +384,21 @@ class ChromiumSession:
     def _on_response(self, response: Any) -> None:
         """Record the site's beacon, if it fires. Never raises into the browser."""
         try:
-            if VIEW_BEACON_PATH in response.url:
-                self.beacons.append((int(response.status), response.url))
+            if VIEW_BEACON_PATH not in response.url:
+                return
+            self.beacons.append((int(response.status), response.url))
+            if response.request.method.upper() != "POST":
+                return
+            headers: Dict[str, str] = {}
+            try:
+                headers = dict(response.headers or {})
+            except Exception:
+                headers = {}
+            self.view_posts.append({
+                "status": int(response.status),
+                "mitigated": str(headers.get("cf-mitigated") or ""),
+                "url": response.url,
+            })
         except Exception:
             pass
 
@@ -454,6 +497,10 @@ class ChromiumSession:
                 report.status = getattr(resp, "status", report.status) or report.status
 
         report.beacon_status = self.last_beacon()
+        if self.view_posts:
+            latest = self.view_posts[-1]
+            report.view_status = latest.get("status")
+            report.view_mitigated = str(latest.get("mitigated") or "")
         report.blocked = dict(self.blocked)
         self.last = report
         self.hits += 1
@@ -462,6 +509,68 @@ class ChromiumSession:
                           f" blocked={sum(report.blocked.values())}"
                           f" beacon={'none' if report.beacon_status is None else report.beacon_status}")
         return report
+
+    # -- driving the view ------------------------------------------------ #
+
+    async def widget_params(self) -> Dict[str, str]:
+        """The Turnstile sitekey/action/cdata the page rendered, for a provider."""
+        if self.page is None:
+            return {"sitekey": "", "action": "", "cdata": ""}
+        try:
+            values = await self.page.evaluate("""() => {
+                const el = document.querySelector('.cf-turnstile');
+                if (!el) return {};
+                return {sitekey: el.getAttribute('data-sitekey') || '',
+                        action: el.getAttribute('data-action') || '',
+                        cdata: el.getAttribute('data-cdata') || ''};
+            }""")
+        except Exception:
+            values = {}
+        return turnstile_params_from(values or {})
+
+    async def trigger_view(self, token: str, wait_ms: int = 15_000) -> Dict[str, Any]:
+        """Hand the page a Turnstile token and let it post the view itself.
+
+        The page exposes `window.getToken` — the React setter behind the
+        widget's `data-callback`. Setting it makes the page's own effect run: it
+        computes the proof-of-work in its worker, signs the payload and POSTs to
+        /api/analytics/view with its own cookies and fingerprint. That is the
+        view request Cloudflare sees from a real browser, which is why this is
+        the route worth driving instead of replaying the body from Python.
+        """
+        page = self.page
+        result: Dict[str, Any] = {"status": None, "mitigated": "", "outcome": "none"}
+        if page is None:
+            result["outcome"] = "no_page"
+            return result
+        deadline = time.time() + max(1.0, wait_ms / 1000.0)
+        while time.time() < deadline:
+            try:
+                if await page.evaluate("() => typeof window.getToken === 'function'"):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        else:
+            result["outcome"] = "no_widget"
+            return result
+
+        before = len(self.view_posts)
+        try:
+            await page.evaluate("(t) => { window.getToken(t); }", token)
+        except Exception as e:
+            result["outcome"] = "inject_failed"
+            result["detail"] = str(e).splitlines()[0][:160]
+            return result
+
+        while time.time() < deadline:
+            if len(self.view_posts) > before:
+                post = dict(self.view_posts[before])
+                post["outcome"] = classify_view(post.get("status"), post.get("mitigated", ""))
+                return post
+            await asyncio.sleep(0.25)
+        result["outcome"] = "no_post"
+        return result
 
     async def cookies(self) -> Dict[str, str]:
         if not self.context:
@@ -486,7 +595,8 @@ class ChromiumFleet:
     (keyed by egress) and its own User-Agent-consistent identity.
     """
 
-    def __init__(self, config, *, fast: bool = True,
+    def __init__(self, config, *, fast: bool = True, tokens: Optional[Sequence[str]] = None,
+                 provider: Any = None, view_wait_ms: int = 15_000,
                  log: Optional[Callable[[str, str], None]] = None) -> None:
         self.config = config
         self.fast = fast
@@ -501,6 +611,17 @@ class ChromiumFleet:
         self.loads: List[float] = []
         self.last_error = ""
         self._explained = False
+        # A view needs a Turnstile token. Supplied tokens are reused in order;
+        # a provider mints one per view. No token means the page loads and stops
+        # there — measured: it never posts a view on its own.
+        self._tokens: List[str] = [t for t in (tokens or []) if t]
+        self._token_index = 0
+        self.provider = provider
+        self.view_wait_ms = max(1000, int(view_wait_ms))
+        self.challenged = 0    # Cloudflare refused the view POST
+        self.rejected = 0      # the view POST reached the app and was refused
+        self.untokened = 0     # no token available, so no view was attempted
+        self.unposted = 0      # token handed over, page never posted
 
     def _assign(self, count: int):
         proxies, bad = self.config.resolved_proxies()
@@ -509,6 +630,35 @@ class ChromiumFleet:
         if not proxies:
             return [None] * count
         return [proxies[i % len(proxies)] for i in range(count)]
+
+    def _next_token(self) -> str:
+        """The next supplied token, in order. Single tokens are single-use."""
+        if not self._tokens:
+            return ""
+        token = self._tokens[self._token_index % len(self._tokens)]
+        self._token_index += 1
+        return token
+
+    async def _token_for(self, session: ChromiumSession, proxy) -> str:
+        """A token for one view: supplied, or minted by the captcha provider."""
+        token = self._next_token()
+        if token:
+            return token
+        if self.provider is None:
+            return ""
+        params = await session.widget_params()
+        if not params.get("sitekey"):
+            self._log("warn", f"{session.worker_id}: no Turnstile widget on the page — "
+                              f"nothing to mint a token for")
+            return ""
+        from .captcha import TurnstileRequest
+
+        proxy_url = proxy.to_curl() if proxy is not None else ""
+        return await self.provider.solve_turnstile(TurnstileRequest(
+            page_url=self.config.url, site_key=params["sitekey"],
+            action=params.get("action", ""), cdata=params.get("cdata", ""),
+            proxy=proxy_url,
+        ))
 
     async def _worker(self, index: int, total: int, proxy, rounds: int) -> None:
         wid = f"{index // max(1, self.config.tabs) + 1}.{index % max(1, self.config.tabs) + 1}"
@@ -530,28 +680,20 @@ class ChromiumFleet:
                 try:
                     report = await session.load()
                     self.loads.append(report.ms)
-                    if report.view_recorded:
-                        self.hits += 1
-                        self._log("hit", f"{wid}: view recorded (beacon {report.beacon_status}, "
-                                         f"load {report.ms:.0f}ms)")
-                    elif report.status and report.status < 400:
-                        # A loaded page is NOT a view. The site records one when
-                        # its own beacon fires, and that beacon waits on a
-                        # Turnstile widget a headless browser cannot finish.
-                        self.loaded += 1
-                        self._log("warn", f"{wid}: page loaded in {report.ms:.0f}ms — no view "
-                                          f"recorded (the site never fired its beacon)")
-                        if not self._explained:
-                            self._explained = True
-                            self._log("warn", "a loaded page is not a view: the profile's view "
-                                              "widget needs a real Turnstile solve. Headless "
-                                              "Chromium with no display does not finish one, so "
-                                              "nothing here counts — use a display (Xvfb), or "
-                                              "--engine api with captcha tokens.")
-                    else:
+                    if not (report.status and report.status < 400):
                         self.misses += 1
                         self.last_error = f"status {report.status} {report.detail}"
                         self._log("miss", f"{wid}: {self.last_error}")
+                    elif report.view_recorded:
+                        self.hits += 1
+                        self._log("hit", f"{wid}: view recorded (beacon {report.beacon_status}, "
+                                         f"load {report.ms:.0f}ms)")
+                    else:
+                        # A loaded page is NOT a view. The site posts one when its
+                        # widget hands the page a Turnstile token; headless never
+                        # solves the widget, so the token has to come from outside.
+                        self.loaded += 1
+                        await self._attempt_view(session, proxy, wid, report)
                 except Exception as e:
                     self.misses += 1
                     self.last_error = str(e).splitlines()[0]
@@ -561,6 +703,46 @@ class ChromiumFleet:
         finally:
             await session.stop()
 
+    async def _attempt_view(self, session: ChromiumSession, proxy, wid: str,
+                            report: LoadReport) -> None:
+        """One view attempt: get a token, hand it to the page, read the result."""
+        try:
+            token = await self._token_for(session, proxy)
+        except Exception as e:
+            self.untokened += 1
+            self.last_error = str(e).splitlines()[0]
+            self._log("warn", f"{wid}: no token — {self.last_error}")
+            return
+        if not token:
+            self.untokened += 1
+            if not self._explained:
+                self._explained = True
+                self._log("warn", "page loaded but no view was attempted: the widget needs a "
+                                  "Turnstile token, and a headless browser never solves it. "
+                                  "Supply --turnstile-token, or a provider with "
+                                  "--captcha-provider/--captcha-key, and the page will post "
+                                  "the view itself.")
+            return
+
+        result = await session.trigger_view(token, self.view_wait_ms)
+        outcome = str(result.get("outcome") or "none")
+        status = result.get("status")
+        if outcome == "counted":
+            self.hits += 1
+            self._log("hit", f"{wid}: view recorded (POST {status}, load {report.ms:.0f}ms)")
+        elif outcome == "challenged":
+            self.challenged += 1
+            self._log("warn", f"{wid}: view POST challenged by Cloudflare "
+                              f"(403 cf-mitigated: challenge) — the page's clearance covers "
+                              f"the profile, not /api/analytics/view")
+        elif outcome == "rejected":
+            self.rejected += 1
+            self._log("miss", f"{wid}: view POST refused ({status})")
+        else:
+            self.unposted += 1
+            self._log("warn", f"{wid}: token handed to the page but no view POST followed "
+                              f"({outcome})")
+
     async def run(self, rounds: int = 1) -> Dict[str, Any]:
         if async_playwright is None:
             raise RuntimeError("playwright is not installed")
@@ -568,6 +750,7 @@ class ChromiumFleet:
         count = max(1, self.config.contexts * self.config.tabs)
         self._running = True
         self.hits = self.misses = 0
+        self.challenged = self.rejected = self.untokened = self.unposted = 0
         self.loads = []
         assignments = self._assign(count)
 
@@ -578,6 +761,14 @@ class ChromiumFleet:
         self._log("boot", "egress " + (
             f"{len({p.label for p in assignments if p})} prox(ies) (per-context)"
             if any(assignments) else "direct"))
+        if self._tokens:
+            self._log("boot", f"tokens: {len(self._tokens)} supplied "
+                              f"({'reused' if len(self._tokens) == 1 else 'in order'})")
+        elif self.provider is not None:
+            self._log("boot", f"tokens: minted per view by {getattr(self.provider, 'name', 'provider')}")
+        else:
+            self._log("warn", "no token source: pages will load and no views will be attempted "
+                              "(--turnstile-token, or --captcha-provider + --captcha-key)")
 
         self._pw = await async_playwright().start()
         args = list(LAUNCH_ARGS)
@@ -594,8 +785,10 @@ class ChromiumFleet:
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.stop()
         if self.loaded and not self.hits:
-            self._log("warn", f"{self.loaded} page(s) loaded and 0 views recorded — this run "
-                              f"proves the egress works, not that views counted")
+            why = ("no token was supplied" if self.untokened
+                   else "Cloudflare challenged every view POST" if self.challenged
+                   else "the page never posted a view")
+            self._log("warn", f"{self.loaded} page(s) loaded and 0 views recorded — {why}")
         return self.status()
 
     async def stop(self) -> None:
@@ -634,6 +827,10 @@ class ChromiumFleet:
             "hits": self.hits,            # beacon-confirmed views
             "loaded": self.loaded,        # loaded, view not recorded
             "misses": self.misses,
+            "challenged": self.challenged,  # view POST hit a Cloudflare challenge
+            "rejected": self.rejected,      # view POST refused by the app
+            "untokened": self.untokened,    # no token, no attempt
+            "unposted": self.unposted,      # token given, page never posted
             "mode": "chromium",
             "load_ms_median": round(median, 1),
             "load_ms_min": round(loads[0], 1) if loads else 0.0,

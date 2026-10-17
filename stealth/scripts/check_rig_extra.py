@@ -492,6 +492,137 @@ def check_chromium_env(tmp: str, check) -> None:
     check("K12 a refused beacon is not a view either, and is reported as refused",
           not loaded.view_recorded and loaded.as_dict()["beacon_status"] == 403)
 
+    # A view POST has three distinguishable endings, and the run has to name the
+    # right one: Cloudflare refusing the path is not the same failure as the app
+    # refusing the payload, and neither is the same as no attempt at all.
+    check("K13 a view POST is classified by what actually came back",
+          chrom.classify_view(200) == "counted"
+          and chrom.classify_view(204, "") == "counted"
+          and chrom.classify_view(403, "challenge") == "challenged"
+          and chrom.classify_view(403, "CHALLENGE") == "challenged"
+          and chrom.classify_view(403, "") == "rejected"
+          and chrom.classify_view(500) == "rejected"
+          and chrom.classify_view(None) == "none",
+          f"got {[chrom.classify_view(s, m) for s, m in ((200, ''), (403, 'challenge'), (403, ''), (None, ''))]}")
+    check("K14 widget attributes are normalised, absent ones included",
+          chrom.turnstile_params_from({"sitekey": "0xabc", "action": "view"})
+          == {"sitekey": "0xabc", "action": "view", "cdata": ""}
+          and chrom.turnstile_params_from({}) == {"sitekey": "", "action": "", "cdata": ""})
+
+    _check_token_drive(check)
+    check_chromium_fonts(tmp, check)
+
+
+def _check_token_drive(check) -> None:
+    """The token hand-off: the page's own setter is what triggers the view."""
+
+    class FakePage:
+        def __init__(self, widget: bool, posts: list, status: int, mitigated: str) -> None:
+            self.widget = widget
+            self.posts = posts
+            self.status = status
+            self.mitigated = mitigated
+            self.injected: list = []
+
+        async def evaluate(self, js: str, arg=None):
+            if "typeof window.getToken" in js:
+                return self.widget
+            if "window.getToken(t)" in js:
+                self.injected.append(arg)
+                self.posts.append({"status": self.status, "mitigated": self.mitigated,
+                                   "url": "https://guns.lol/api/analytics/view"})
+                return None
+            return None
+
+    from stealth.config import StealthConfig
+
+    session = chrom.ChromiumSession(StealthConfig(target="cat"), fast=False)
+
+    session.page = FakePage(True, session.view_posts, 403, "challenge")
+    out = asyncio.run(session.trigger_view("tok-1", wait_ms=2000))
+    check("K15 handing a token to the page fires its own view POST and reports the outcome",
+          session.page.injected == ["tok-1"] and out.get("outcome") == "challenged"
+          and out.get("status") == 403,
+          f"got {out} injected={session.page.injected}")
+
+    session.view_posts.clear()
+    session.page = FakePage(True, session.view_posts, 200, "")
+    out2 = asyncio.run(session.trigger_view("tok-2", wait_ms=2000))
+    check("K16 a 200 on the page's own POST is a counted view",
+          out2.get("outcome") == "counted" and out2.get("status") == 200, f"got {out2}")
+
+    session.page = FakePage(False, [], 0, "")
+    idle = asyncio.run(session.trigger_view("tok-3", wait_ms=1200))
+    check("K17 no widget on the page is reported as such, not as a silent zero",
+          idle.get("outcome") == "no_widget", f"got {idle}")
+
+    # Fleet accounting: a challenged view, a counted view, and "no token" must
+    # land in three different buckets, or the summary line lies about the run.
+    class StubSession:
+        worker_id = "9.9"
+
+        def __init__(self, outcome):
+            self.outcome = outcome
+            self.given = []
+
+        async def widget_params(self):
+            return {"sitekey": "0xkey", "action": "", "cdata": ""}
+
+        async def trigger_view(self, token, wait_ms=0):
+            self.given.append(token)
+            return self.outcome
+
+    logs: list = []
+    fleet = chrom.ChromiumFleet(StealthConfig(target="cat"), tokens=["supplied-token"],
+                                log=lambda tag, msg: logs.append((tag, msg)))
+    stub = StubSession({"status": 403, "mitigated": "challenge", "outcome": "challenged"})
+    asyncio.run(fleet._attempt_view(stub, None, "9.9", chrom.LoadReport(ms=100.0)))
+    stub_ok = StubSession({"status": 200, "mitigated": "", "outcome": "counted"})
+    asyncio.run(fleet._attempt_view(stub_ok, None, "9.9", chrom.LoadReport(ms=100.0)))
+    bare = chrom.ChromiumFleet(StealthConfig(target="cat"), log=lambda *a: None)
+    asyncio.run(bare._attempt_view(stub_ok, None, "9.9", chrom.LoadReport(ms=100.0)))
+    check("K18 the fleet counts a refused view, a counted view and a missing token apart",
+          fleet.challenged == 1 and fleet.hits == 1 and fleet.untokened == 0
+          and stub.given == ["supplied-token"] and bare.untokened == 1
+          and bare.hits == 0, f"got hits={fleet.hits} challenged={fleet.challenged} "
+                              f"bare={bare.untokened}/{bare.hits}")
+    # Minting: the provider must be told *this* page's widget — sitekey, action
+    # and cdata come off the rendered div, because a token minted for another
+    # widget is worthless here.
+    class StubProvider:
+        name = "stub"
+
+        def __init__(self) -> None:
+            self.req = None
+
+        async def solve_turnstile(self, req):
+            self.req = req
+            return "minted-token"
+
+    prov = StubProvider()
+    minting = chrom.ChromiumFleet(StealthConfig(target="cat"), provider=prov,
+                                  log=lambda *a: None)
+    minted = asyncio.run(minting._token_for(stub, None))
+    check("K20 a provider is asked for a token for this page's widget",
+          minted == "minted-token" and prov.req is not None
+          and prov.req.site_key == "0xkey" and prov.req.page_url.endswith("/cat"),
+          f"got {minted} req={getattr(prov.req, '__dict__', None)}")
+
+    detail = bare.status()
+    check("K19 the summary exposes why a view did not count",
+          detail.get("challenged") == 0 and detail.get("untokened") == 1
+          and detail.get("rejected") == 0 and detail.get("unposted") == 0,
+          f"got {detail}")
+
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# K — the font bootstrap (kept apart: it mutates the process environment)
+# --------------------------------------------------------------------------- #
+
+
+def check_chromium_fonts(tmp: str, check) -> None:
     # The font bootstrap is what keeps headless Chromium alive on a slim host:
     # without a resolvable fontconfig its Skia font manager aborts the process.
     libs = os.path.join(ROOT, ".foxlibs", "usr", "share", "fonts")
@@ -594,8 +725,12 @@ def check_engine_names(_tmp: str, check) -> None:
     help_text = actions["engine"].help + actions["rounds"].help
     check("N8 the engine choices are the canonical names plus the legacy alias",
           set(engines) == {"camoufox", "chromium", "api", "guns"}, f"got {engines}")
-    check("N9 the help says which engines need no key, and what 0 rounds means",
-          help_text.count("no API key") >= 2 and "loops until" in help_text,
+    # The browser engines are keyless to *run* but a view needs a token, so the
+    # help has to say both — "no key" alone was the misleading half.
+    check("N9 the help says which engines need no key, that a view needs a token, "
+          "and what 0 rounds means",
+          "no key" in help_text and "turnstile-token" in help_text.lower()
+          and "loops until" in help_text,
           f"got {help_text!r}")
 
 

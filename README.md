@@ -69,7 +69,7 @@ python -m stealth <username> --contexts 2 --proxy-file proxies.txt          # ca
 python -m stealth <username> --engine chromium --contexts 4                  # fast chromium
 python -m stealth <username> --engine chromium --headful --rounds 0          # loop until Ctrl-C
 python -m stealth <username> --engine api --count 20 --concurrency 4        # guns.lol's own API
-python stealth/scripts/check_rig.py                                          # 122 offline checks
+python stealth/scripts/check_rig.py                                          # 130 offline checks
 ```
 
 An *engine* is how a view gets sent, and the three are named for that — not for
@@ -78,15 +78,29 @@ the site they talk to:
 | `--engine` | what it is | API key? |
 |---|---|---|
 | `camoufox` | a real browser (patched Firefox): fingerprint, humanized motion, TLS impersonation, Turnstile handler | **no** |
-| `chromium` | a fast browser fleet: one browser, many contexts (Chromium is the only engine with per-context proxies), heavy resources dropped | **no** |
+| `chromium` | a fast browser fleet: one browser, many contexts (Chromium is the only engine with per-context proxies), heavy resources dropped | **no to load** — a *view* needs a Turnstile token: yours, or minted with a key |
 | `api` | no browser at all: scrapes the page's `_gpp_ch` challenge, solves its rotating WASM proof-of-work in `node`, posts the signed view straight to guns.lol's analytics endpoint | **yes** — a Turnstile token and a `cf_clearance` for that POST path, from a captcha service or supplied by you |
 
 `guns` is still accepted as an old name for `api`; it named the site, not the
 mechanism, which confused everyone — including whoever wrote it.
 
-So: **the two browser engines need no key, and the API engine needs one.** The
-trade is that a key buys you the ~3.7 s/view path with no browser, while the
-keyless engines need a real display to record anything (see below).
+So: **neither browser engine needs a key to run, and the API engine needs one.**
+But "runs" and "records a view" are different bars, and only one of them is free:
+the site counts a view when its own widget hands the page a Turnstile token, and
+a headless browser never earns one. Give `chromium` a token and the page posts
+the view itself:
+
+```bash
+python -m stealth <user> --engine chromium --rounds 0 \
+  --captcha-provider capmonster --captcha-key $CAPTCHA_KEY   # one token per view
+```
+
+A key therefore buys the browser engines a cheaper thing than the API engine
+needs: `chromium` only wants the *token* (the browser brings its own cookies,
+fingerprint and proof-of-work), while `--engine api` wants a token **and** a
+`cf_clearance` for the POST path. Without either, `chromium` still loads profiles
+at ~1.8 s and reports `views=0 loaded_no_view=N` — useful for proving an egress
+works, not for farming.
 
 To farm in a loop, keep the browser warm instead of restarting it:
 `--rounds 0` runs until you stop it, reusing the same launch, context and cookies.
@@ -98,16 +112,30 @@ Measured on the live target from a 4-core box: Chromium loads the profile in
 
 ### What actually counts as a view
 
-A loaded page is not a view. The site records one when *its own* beacon POSTs to
-`/api/analytics/view`, and every engine here reports `views` (beacon confirmed)
-separately from `loaded`. On this box a headless Chromium sits on the profile for
-over a minute, looping, without ever firing the beacon — the view widget needs a
-Turnstile solve it cannot finish with no display — so the run says
-`views=0 loaded_no_view=4` rather than reporting four loads as four wins. Give a
-browser engine a display (`--headful`, or Xvfb) for views to count, or use
-`--engine api` with captcha tokens. Cloudflare challenges that POST path
-separately from the profile page, so the token and clearance have to be minted
-**for it**.
+A loaded page is not a view. The site records one when its own code POSTs a
+signed payload to `/api/analytics/view`: a Turnstile token plus a proof-of-work
+proof, both produced on the page. Every engine reports `views` (that POST
+succeeded) separately from `loaded`.
+
+`chromium` drives that path directly. The page exposes `window.getToken` — the
+setter behind the widget's callback — so handing it a token makes the page
+compute its own proof-of-work and post the view with its own cookies and
+fingerprint (`--view-wait` bounds the wait, default 15 s). The run names the
+outcome instead of rounding it to zero:
+
+| summary field | meaning |
+|---|---|
+| `views` | the view POST came back 2xx — the count moved |
+| `challenged` | 403 with `cf-mitigated: challenge`: Cloudflare refused the POST path |
+| `rejected` | the POST reached the app and was refused |
+| `no_token` | nothing to hand the page, so no view was attempted |
+| `unposted` | a token was handed over and the page still never posted |
+
+Measured here: with a token supplied, the page posts the exact signed view within
+seconds, and this egress gets `403 cf-mitigated: challenge` on it **even with the
+page's own `cf_clearance`** — so the count is 0 and the reason is `challenged`,
+not a silent zero. A `cf_clearance` is not what unblocks that path from here; an
+egress Cloudflare trusts is.
 
 Workers that share a proxy (or run with none) share one Cloudflare clearance
 instead of each solving the same challenge on the same IP, and their egress

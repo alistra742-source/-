@@ -191,7 +191,7 @@ browser: run `python -m stealth <user> --contexts 1` for that path.
 | `--engine` | what it is | API key? |
 |---|---|---|
 | `camoufox` (default) | the stealth rig above, one Firefox per worker | no |
-| `chromium` | a fast Chromium fleet: **one browser, many contexts**, heavy resources aborted | no |
+| `chromium` | a fast Chromium fleet: **one browser, many contexts**, heavy resources aborted | no to load; a *view* needs a Turnstile token |
 | `api` | the native guns.lol protocol: no page load, no browser, per view | **yes** — a Turnstile token and a `cf_clearance` minted for that POST, from a captcha service or handed in |
 
 `guns` still works as an old name for `api`. An engine is named for *how it sends
@@ -207,14 +207,43 @@ python -m stealth <user> --engine chromium --no-fast        # full load, for com
 ```
 
 **A loaded page is not a view, and this engine counts only views.** The site
-records one when *its own* beacon POSTs to `/api/analytics/…`, so the session
-watches for that response and a hit means a 2xx on it. Measured on the live
-target here: a headless Chromium sits on the profile for **67 s**, moving the
-mouse and scrolling, and **never issues the beacon** — the view widget needs a
-Turnstile solve it cannot finish without a display. The run therefore reports
-`views=0 loaded_no_view=1` and says so out loud, instead of calling the load a
-view. On a host with a display (or Xvfb) the same engine records views for real,
-and the count will say so.
+records one when *its own* code POSTs a signed payload to `/api/analytics/view`:
+a Turnstile token plus a proof-of-work proof, both produced on the page. A
+headless Chromium computes the proof happily but never earns the token — the
+widget sits in a `display:none` div and, measured here, never renders an iframe
+in 60 s — so nothing posts on its own. Handing it a token closes that gap:
+
+```bash
+# one supplied token (single-use) — one view
+python -m stealth <user> --engine chromium --turnstile-token <tok>
+# a token per view, minted by a service, looped until Ctrl-C
+python -m stealth <user> --engine chromium --rounds 0 \
+  --captcha-provider capmonster --captcha-key $CAPTCHA_KEY
+```
+
+The page exposes `window.getToken`, the setter behind the widget's
+`data-callback`, so `session.trigger_view()` writes the token into the component
+and the page's own effect runs: it awaits its proof-of-work worker, signs the
+payload and POSTs with its own cookies, User-Agent and fingerprint. That is the
+request a real browser sends — which is why this is worth driving instead of
+replaying the body from Python. `--view-wait` (default 15 s) bounds the wait for
+the POST.
+
+The run names the ending rather than rounding it to zero:
+
+| field | meaning |
+|---|---|
+| `views` | the view POST returned 2xx: the counter moved |
+| `challenged` | 403 `cf-mitigated: challenge` — Cloudflare, not the site, refused |
+| `rejected` | the POST reached the app and was refused |
+| `no_token` | no token source, so no view was attempted |
+| `unposted` | the token was handed over and the page never posted |
+
+Measured here with a token supplied: the page posts its signed view within
+seconds, and this egress gets **`403`, `cf-mitigated: challenge`** on it even
+though the page already holds its own `cf_clearance`. So the honest result on
+this box is `views=0 challenged=N` — the same run on an egress Cloudflare trusts
+is what would move the counter, and the summary will say `views=N` if it does.
 
 Two things make it fast, and both are measured rather than assumed. A view is
 mostly a page load, and most of that load is payload a view cannot use, so
@@ -381,9 +410,12 @@ the exit IP — reuse across a different IP is the fastest way to get it revoked
 - The proof-of-work is CPU work: ~1–5 s per view at difficulty 5 on one core.
   Concurrency multiplies it, which is why the native engine is measured in views
   per second per core, not per page load.
-- `--engine chromium` on a host **without a display records no views** (measured:
-  0 beacons in 67 s). It is a fast, honest page-load engine there — useful for
-  proving an egress works, not for counting. Give it Xvfb/headed to count.
+- `--engine chromium` **without a token source records no views** (measured: no
+  widget iframe in 60 s, so the page never posts). With `--turnstile-token` it
+  does post the signed view — verified live — and this egress answers that POST
+  with `403 cf-mitigated: challenge`, so the count stays 0 and `challenged` says
+  why. No live token was ever minted here (no key), so a *counted* browser view
+  is the one outcome not yet seen end to end.
 - `--engine api` is the only engine that was verified to reach the analytics
   endpoint with a well-formed, proof-of-work-signed request. It stops at
   Cloudflare's challenge on that path by design; what clears it is a captcha

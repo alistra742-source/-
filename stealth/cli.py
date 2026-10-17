@@ -83,11 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     eng = p.add_argument_group("engines")
     eng.add_argument("--engine", choices=("camoufox", "chromium", "api", "guns"),
                      default=os.environ.get("STEALTH_ENGINE", "camoufox"),
-                     help="camoufox = stealth browser (default, no API key); chromium = "
-                          "fast browser fleet, one browser many contexts (no API key); "
-                          "api = talk to guns.lol's own endpoints directly, no browser "
-                          "(needs a captcha key or your own tokens). 'guns' is the old "
-                          "name for 'api'.")
+                     help="camoufox = stealth browser (default, no key); chromium = fast "
+                          "browser fleet, one browser many contexts (no key to load, but a "
+                          "view needs --turnstile-token or a captcha provider); api = talk "
+                          "to guns.lol's own endpoints directly, no browser (needs a token "
+                          "and a clearance). 'guns' is the old name for 'api'.")
     eng.add_argument("--no-fast", action="store_true",
                      help="chromium: load the full page (stylesheets, images, fonts) "
                           "and wait for 'load' instead of dropping heavy resources")
@@ -98,8 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="chromium: navigation wait (default domcontentloaded)")
     eng.add_argument("--idle-wait", type=int, default=0,
                      help="chromium: also wait up to N ms for networkidle (default 0)")
+    eng.add_argument("--view-wait", type=int, default=15_000,
+                     help="chromium: how long to wait for the page's view POST after a "
+                          "token is handed over (default 15000 ms)")
 
-    guns = p.add_argument_group("native guns.lol protocol (--engine api, alias guns)")
+    guns = p.add_argument_group("tokens for a view (--engine api, or chromium's view hand-off)")
     guns.add_argument("--count", type=int, default=1, help="views to record (default 1)")
     guns.add_argument("--concurrency", type=int, default=4,
                       help="views recorded at once (default 4)")
@@ -191,23 +194,52 @@ async def _run(args: argparse.Namespace) -> int:
     if cfg.engine == "api":
         return await _run_guns(cfg, args, log)
 
-    fleet = ChromiumFleet(cfg, fast=cfg.fast_browser, log=log) if cfg.engine == "chromium" \
-        else StealthFleet(cfg, log=log)
+    # A browser records a view by handing the page a Turnstile token; the page
+    # then does its own proof-of-work and POST. Minting that token is the only
+    # thing a key buys the browser engines.
+    provider = None
+    if cfg.engine == "chromium" and cfg.captcha_provider:
+        from .captcha import CaptchaError, build_provider
+
+        try:
+            provider = build_provider(cfg.captcha_provider, cfg.captcha_key, log=log)
+        except CaptchaError as e:
+            log("error", str(e))
+            return 2
+        log("chromium", f"captcha provider: {provider.name}")
+
+    if cfg.engine == "chromium":
+        fleet = ChromiumFleet(cfg, fast=cfg.fast_browser,
+                              tokens=[cfg.turnstile_token] if cfg.turnstile_token else None,
+                              provider=provider, view_wait_ms=args.view_wait, log=log)
+    else:
+        fleet = StealthFleet(cfg, log=log)
     rounds = max(0, args.rounds)
     if rounds == 0:
         log("boot", "--rounds 0: looping until you stop it (Ctrl-C)")
     try:
         status = await fleet.run(rounds=rounds)
-    except KeyboardInterrupt:
-        await fleet.stop()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl-C reaches an asyncio program as a cancellation of the main task,
+        # not as KeyboardInterrupt inside it. Shielding the stop still closes the
+        # browser, so an interrupted loop leaves no orphan renderer behind.
+        await asyncio.shield(fleet.stop())
         log("stop", "interrupted")
         return 130
     except Exception as e:
         log("error", str(e).splitlines()[0])
         return 3
+    finally:
+        if provider is not None:
+            await provider.close()
 
     log("done", f"views={status['hits']} loaded_no_view={status.get('loaded', 0)} "
                  f"misses={status['misses']} mode={status['mode']}")
+    if status.get("untokened") or status.get("challenged") or status.get("rejected"):
+        log("why", f"no_token={status.get('untokened', 0)} "
+                    f"challenged={status.get('challenged', 0)} "
+                    f"rejected={status.get('rejected', 0)} "
+                    f"unposted={status.get('unposted', 0)}")
     if status.get("load_ms_median"):
         log("speed", f"median page load {status['load_ms_median']:.0f}ms "
                      f"(min {status['load_ms_min']:.0f}ms)"
