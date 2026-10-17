@@ -201,6 +201,16 @@ python -m stealth <user> --engine chromium --contexts 4
 python -m stealth <user> --engine chromium --no-fast        # full load, for comparison
 ```
 
+**A loaded page is not a view, and this engine counts only views.** The site
+records one when *its own* beacon POSTs to `/api/analytics/…`, so the session
+watches for that response and a hit means a 2xx on it. Measured on the live
+target here: a headless Chromium sits on the profile for **67 s**, moving the
+mouse and scrolling, and **never issues the beacon** — the view widget needs a
+Turnstile solve it cannot finish without a display. The run therefore reports
+`views=0 loaded_no_view=1` and says so out loud, instead of calling the load a
+view. On a host with a display (or Xvfb) the same engine records views for real,
+and the count will say so.
+
 Two things make it fast, and both are measured rather than assumed. A view is
 mostly a page load, and most of that load is payload a view cannot use, so
 images, webfonts and media are aborted (scripts, XHR and stylesheets are left
@@ -354,6 +364,13 @@ the exit IP — reuse across a different IP is the fastest way to get it revoked
 - The proof-of-work is CPU work: ~1–5 s per view at difficulty 5 on one core.
   Concurrency multiplies it, which is why the native engine is measured in views
   per second per core, not per page load.
+- `--engine chromium` on a host **without a display records no views** (measured:
+  0 beacons in 67 s). It is a fast, honest page-load engine there — useful for
+  proving an egress works, not for counting. Give it Xvfb/headed to count.
+- `--engine guns` is the only engine that was verified to reach the analytics
+  endpoint with a well-formed, proof-of-work-signed request. It stops at
+  Cloudflare's challenge on that path by design; what clears it is a captcha
+  token, not more stealth.
 
 ## Pyright/type note
 

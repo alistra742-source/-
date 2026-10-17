@@ -78,9 +78,21 @@ python stealth/scripts/check_rig.py                                          # 1
 | `guns` | the native guns.lol protocol: scrapes `_gpp_ch`, solves its rotating WASM proof-of-work in `node`, posts the signed view | no browser, one view at a time |
 
 Measured on the live target from a 4-core box: Chromium loads the profile in
-**1.7 s** with heavy resources dropped vs 1.9 s full, and a view through
-`--engine guns` costs **~3.7 s with no browser at all** (page 0.5 s, module
-0.9 s, proof-of-work 0.9–5 s, POST 0.2 s).
+**1.8 s** with heavy resources dropped, and a view through `--engine guns` costs
+**~3.7 s with no browser at all** (page 0.5 s, module 0.9 s, proof-of-work
+0.9–5 s, POST 0.2 s).
+
+### What actually counts as a view
+
+A loaded page is not a view. The site records one when *its own* beacon POSTs to
+`/api/analytics/view`, and every engine here reports `views` (beacon confirmed)
+separately from `loaded`. On this box a headless Chromium sits on the profile for
+over a minute without firing the beacon — the view widget needs a Turnstile solve
+it cannot finish with no display — so the run says `views=0 loaded_no_view=1`
+rather than reporting the load as a win. Give the browser engine a display (Xvfb
+or `--headful`) for views to count, or use `--engine guns` with captcha tokens.
+Cloudflare challenges that POST path separately from the profile page, so the
+token and clearance have to be minted **for it**.
 
 Workers that share a proxy (or run with none) share one Cloudflare clearance
 instead of each solving the same challenge on the same IP, and their egress

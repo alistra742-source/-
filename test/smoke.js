@@ -164,6 +164,17 @@ async function main() {
   check('SIGTERM exits the process', app.getExit() !== null, `exit=${app.getExit()}`);
   check('listener closed after shutdown', await refuses(port));
 
+  console.log('\nView accounting');
+  const { isViewBeacon, VIEWS } = require(path.join(ROOT, 'runner.js'));
+  check('only a successful POST to the analytics path is a view',
+    isViewBeacon('https://guns.lol/api/analytics/view', 'POST', 200) &&
+    !isViewBeacon('https://guns.lol/api/analytics/view', 'GET', 200) &&
+    !isViewBeacon('https://guns.lol/api/analytics/view', 'POST', 403) &&
+    !isViewBeacon('https://guns.lol/guns.lol', 'POST', 200));
+  check('a loaded page is counted separately from a recorded view',
+    typeof st.viewsRecorded === 'number' && st.hits >= st.viewsRecorded,
+    `hits=${st.hits} viewsRecorded=${st.viewsRecorded}`);
+
   console.log('\nTor mode');
 
   // No daemon at all: refuse up front rather than launch ten browsers that cannot connect.

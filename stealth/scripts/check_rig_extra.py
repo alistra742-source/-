@@ -468,6 +468,24 @@ def check_chromium_env(tmp: str, check) -> None:
           and any("disable-background-timer-throttling" in a for a in chrom.LAUNCH_ARGS),
           f"args={chrom.LAUNCH_ARGS}")
 
+    # A loaded page is not a view. Only the site's own beacon proves one, and
+    # these are the three ways a run could lie about it.
+    check("K9 only a successful POST to the site's analytics path is a view",
+          chrom.is_view_beacon("https://guns.lol/api/analytics/view", "POST", 200)
+          and not chrom.is_view_beacon("https://guns.lol/api/analytics/view", "GET", 200)
+          and not chrom.is_view_beacon("https://guns.lol/api/analytics/view", "POST", 403)
+          and not chrom.is_view_beacon("https://guns.lol/guns.lol", "POST", 200))
+    loaded = chrom.LoadReport(url="https://guns.lol/x", status=200)
+    check("K10 a page that loaded with no beacon is NOT a recorded view",
+          loaded.view_recorded is False and loaded.as_dict()["view_recorded"] is False,
+          f"got {loaded.as_dict()}")
+    loaded.beacon_status = 200
+    check("K11 the site's own beacon is what makes it a view",
+          loaded.view_recorded and loaded.as_dict()["beacon_status"] == 200)
+    loaded.beacon_status = 403
+    check("K12 a refused beacon is not a view either, and is reported as refused",
+          not loaded.view_recorded and loaded.as_dict()["beacon_status"] == 403)
+
     # The font bootstrap is what keeps headless Chromium alive on a slim host:
     # without a resolvable fontconfig its Skia font manager aborts the process.
     libs = os.path.join(ROOT, ".foxlibs", "usr", "share", "fonts")

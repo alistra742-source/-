@@ -200,7 +200,8 @@ async def _run(args: argparse.Namespace) -> int:
         log("error", str(e).splitlines()[0])
         return 3
 
-    log("done", f"hits={status['hits']} misses={status['misses']} mode={status['mode']}")
+    log("done", f"views={status['hits']} loaded_no_view={status.get('loaded', 0)} "
+                 f"misses={status['misses']} mode={status['mode']}")
     if status.get("load_ms_median"):
         log("speed", f"median page load {status['load_ms_median']:.0f}ms "
                      f"(min {status['load_ms_min']:.0f}ms)"

@@ -107,6 +107,24 @@ const LAUNCH_ARGS = [
  * status, so a run can prove the blocker actually fired. */
 const DROPPED = { count: 0 };
 
+/*
+ * A loaded page is not a view.
+ *
+ * The site records a view when its own beacon POSTs to /api/analytics/…, and
+ * that beacon waits on a Turnstile widget. Measured on the live target: a
+ * headless Chromium sits on the profile for over a minute, moving the mouse and
+ * scrolling, and never issues the request. So `hits` (a page that loaded) and
+ * `viewsRecorded` (a beacon that succeeded) are counted separately, and a run
+ * that loads pages without recording views says so instead of reporting the
+ * load as a view.
+ */
+const VIEW_BEACON = /\/api\/analytics\//;
+const VIEWS = { recorded: 0 };
+
+function isViewBeacon(url, method, status) {
+  return method === 'POST' && VIEW_BEACON.test(url || '') && status >= 200 && status < 300;
+}
+
 /* Abort heavy resource types. Routing disables the HTTP cache, which costs
  * nothing here: each worker loads one page per round. */
 async function installBlocker(page) {
@@ -421,6 +439,8 @@ class Runner extends EventEmitter {
     this.lastError = null;
     this.loads = [];          // per-hit page load time, ms
     DROPPED.count = 0;        // heavy requests aborted this run
+    VIEWS.recorded = 0;       // view beacons the site actually fired
+    this._viewWarned = false;
     this.plan = null;
     this.torControlDown = false;
     this.torWarned = false;
@@ -446,6 +466,7 @@ class Runner extends EventEmitter {
       waitUntil: WAIT_UNTIL,
       droppedRequests: DROPPED.count,
       loadMsMedian: median(this.loads),
+      viewsRecorded: VIEWS.recorded,
     };
   }
 
@@ -549,6 +570,11 @@ class Runner extends EventEmitter {
           window.chrome = window.chrome || { runtime: {} };
         });
 
+        // Count the site's own view beacon, if it fires — that is the only
+        // evidence a view counted.
+        page.on('response', (r) => {
+          if (isViewBeacon(r.url(), r.request().method(), r.status())) VIEWS.recorded++;
+        });
         await installBlocker(page);
         const t0 = Date.now();
         const resp = await page.goto(this.plan.url, { waitUntil: WAIT_UNTIL, timeout: this.plan.navTimeout });
@@ -559,8 +585,16 @@ class Runner extends EventEmitter {
 
         if (this.stopping) return;
         this.hits++;
+        const recorded = VIEWS.recorded > 0;
         this.log('hit', `p${id}${proxy ? ' ' + proxy.label : ' tor'}`,
-          `view sent (${resp ? resp.status() : 'no response'} in ${loadMs}ms, ${DROPPED.count} heavy request(s) dropped)`);
+          `page loaded (${resp ? resp.status() : 'no response'} in ${loadMs}ms, `
+          + `${DROPPED.count} heavy request(s) dropped, views recorded so far: ${VIEWS.recorded})`);
+        if (!recorded && !this._viewWarned) {
+          this._viewWarned = true;
+          this.log('warn', 'view', 'pages are loading but the site has not fired a view beacon: ' +
+            'the profile\'s view widget needs a real Turnstile solve, which headless Chromium ' +
+            'without a display does not finish — run under Xvfb (or headed) for views to count');
+        }
         this.emit('hit', { worker: id, proxy: proxy ? proxy.label : 'tor', hits: this.hits });
         this._emitState();
       } catch (e) {
@@ -723,4 +757,5 @@ module.exports = {
   Runner, parseProxyLine, parseProxyText, loadProxies,
   ensureChromium, ensureChromiumDeps, chromiumExecutable, PROJECT_BROWSERS,
   median, FAST, DROP, WAIT_UNTIL, LAUNCH_ARGS, DROPPED, applyLibPath, PROJECT_LIBS_ROOTS,
+  VIEWS, isViewBeacon,
 };

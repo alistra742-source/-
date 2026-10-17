@@ -232,9 +232,21 @@ async def block_heavy(page, drop: Sequence[str] = HEAVY_RESOURCES,
     return counts
 
 
+# The beacon the site fires when it records a view. A page load is not a view:
+# measured on the live target, a headless Chromium sits on the profile for over a
+# minute, with mouse movement and scrolling, without ever issuing this request.
+VIEW_BEACON_PATH = "/api/analytics/"
+
+
+def is_view_beacon(url: str, method: str = "POST", status: int = 0) -> bool:
+    """Whether a response is the site's own view beacon, and it succeeded."""
+    return (method.upper() == "POST" and VIEW_BEACON_PATH in (url or "")
+            and 200 <= int(status) < 300)
+
+
 @dataclass
 class LoadReport:
-    """What one fast page load cost, and whether it got through."""
+    """What one fast page load cost, and whether it recorded a view."""
 
     url: str = ""
     status: int = 0
@@ -244,11 +256,18 @@ class LoadReport:
     blocked: Dict[str, int] = field(default_factory=dict)
     challenge_ms: float = 0.0
     title: str = ""
+    beacon_status: Optional[int] = None
+
+    @property
+    def view_recorded(self) -> bool:
+        """A loaded page is not a recorded view; only a successful beacon is."""
+        return self.beacon_status is not None and 200 <= self.beacon_status < 300
 
     def as_dict(self) -> Dict[str, Any]:
         return {"url": self.url, "status": self.status, "ms": round(self.ms, 1),
                 "cleared": self.cleared, "blocked": dict(self.blocked),
                 "challenge_ms": round(self.challenge_ms, 1), "title": self.title,
+                "beacon_status": self.beacon_status, "view_recorded": self.view_recorded,
                 "detail": self.detail}
 
 
@@ -282,6 +301,9 @@ class ChromiumSession:
         self.guard: Optional[CloudflareGuard] = None
         self.blocked: Dict[str, int] = {}
         self.last: Optional[LoadReport] = None
+        # Every response to the site's analytics endpoints, in order. This is the
+        # only evidence that a view counted; a 200 on the page is not.
+        self.beacons: List[Tuple[int, str]] = []
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -315,6 +337,7 @@ class ChromiumSession:
         self.context = await self.browser.new_context(**opts)
         self.page = await self.context.new_page()
         await self.page.add_init_script(INIT_SCRIPT)
+        self.page.on("response", self._on_response)
         if self.fast and self.drop:
             self.blocked = await block_heavy(self.page, self.drop)
             # block_heavy returns a live dict that the route handler keeps
@@ -327,6 +350,17 @@ class ChromiumSession:
             verbose=self.config.verbose,
             log=self._log,
         )
+
+    def _on_response(self, response: Any) -> None:
+        """Record the site's beacon, if it fires. Never raises into the browser."""
+        try:
+            if VIEW_BEACON_PATH in response.url:
+                self.beacons.append((int(response.status), response.url))
+        except Exception:
+            pass
+
+    def last_beacon(self) -> Optional[int]:
+        return self.beacons[-1][0] if self.beacons else None
 
     async def stop(self) -> None:
         if self.context:
@@ -419,12 +453,14 @@ class ChromiumSession:
                                             timeout=self.config.nav_timeout_ms)
                 report.status = getattr(resp, "status", report.status) or report.status
 
+        report.beacon_status = self.last_beacon()
         report.blocked = dict(self.blocked)
         self.last = report
         self.hits += 1
         self._log("load", f"{self.worker_id}: {report.status} in {report.ms:.0f}ms"
                           f"{' (cleared ' + format(report.challenge_ms, '.0f') + 'ms)' if report.challenge_ms else ''}"
-                          f" blocked={sum(report.blocked.values())}")
+                          f" blocked={sum(report.blocked.values())}"
+                          f" beacon={'none' if report.beacon_status is None else report.beacon_status}")
         return report
 
     async def cookies(self) -> Dict[str, str]:
@@ -459,10 +495,12 @@ class ChromiumFleet:
         self._browser = None
         self._sessions: List[ChromiumSession] = []
         self._running = False
-        self.hits = 0
+        self.hits = 0          # views the site actually recorded (beacon confirmed)
+        self.loaded = 0        # pages that loaded, but recorded no view
         self.misses = 0
         self.loads: List[float] = []
         self.last_error = ""
+        self._explained = False
 
     def _assign(self, count: int):
         proxies, bad = self.config.resolved_proxies()
@@ -489,9 +527,24 @@ class ChromiumFleet:
                 try:
                     report = await session.load()
                     self.loads.append(report.ms)
-                    if report.status and report.status < 400:
+                    if report.view_recorded:
                         self.hits += 1
-                        self._log("hit", f"{wid}: view sent ({report.status} in {report.ms:.0f}ms)")
+                        self._log("hit", f"{wid}: view recorded (beacon {report.beacon_status}, "
+                                         f"load {report.ms:.0f}ms)")
+                    elif report.status and report.status < 400:
+                        # A loaded page is NOT a view. The site records one when
+                        # its own beacon fires, and that beacon waits on a
+                        # Turnstile widget a headless browser cannot finish.
+                        self.loaded += 1
+                        self._log("warn", f"{wid}: page loaded in {report.ms:.0f}ms — no view "
+                                          f"recorded (the site never fired its beacon)")
+                        if not self._explained:
+                            self._explained = True
+                            self._log("warn", "a loaded page is not a view: the profile's view "
+                                              "widget needs a real Turnstile solve. Headless "
+                                              "Chromium with no display does not finish one, so "
+                                              "nothing here counts — use a display (Xvfb), or "
+                                              "--engine guns with captcha tokens.")
                     else:
                         self.misses += 1
                         self.last_error = f"status {report.status} {report.detail}"
@@ -535,6 +588,9 @@ class ChromiumFleet:
                 await asyncio.sleep(min(0.5, self.config.spawn_stagger_s))
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.stop()
+        if self.loaded and not self.hits:
+            self._log("warn", f"{self.loaded} page(s) loaded and 0 views recorded — this run "
+                              f"proves the egress works, not that views counted")
         return self.status()
 
     async def stop(self) -> None:
@@ -570,7 +626,8 @@ class ChromiumFleet:
             "url": self.config.url,
             "target": self.config.target,
             "workers": len(self._sessions),
-            "hits": self.hits,
+            "hits": self.hits,            # beacon-confirmed views
+            "loaded": self.loaded,        # loaded, view not recorded
             "misses": self.misses,
             "mode": "chromium",
             "load_ms_median": round(median, 1),
