@@ -217,8 +217,14 @@ class StealthConfig:
     share_clearance: bool = True
     clearance_wait_s: float = 30.0   # how long to wait for a peer's clearance
 
-    # which engine drives the run: the Camoufox rig (stealth), a fast Chromium
-    # fleet (volume), or the native guns.lol protocol (no page load at all)
+    # Which engine drives the run, by what it actually does:
+    #
+    #   camoufox  a stealthy browser            (no API key)
+    #   chromium  a fast browser fleet          (no API key)
+    #   api       guns.lol's own endpoints      (needs a captcha key or tokens)
+    #
+    # "guns" is accepted as the old name for "api" — it named the site, not the
+    # mechanism, and that was confusing.
     engine: str = "camoufox"
 
     # fast-load tuning for the Chromium engine. `load` and `networkidle` wait on
@@ -228,7 +234,7 @@ class StealthConfig:
     wait_until: str = "domcontentloaded"
     idle_wait_ms: int = 0
 
-    # native guns.lol protocol (engine="guns")
+    # native guns.lol protocol (engine="api")
     view_count: int = 1
     view_concurrency: int = 4
     device: str = "desktop"
@@ -264,7 +270,7 @@ class StealthConfig:
             raise ValueError("target has invalid characters")
         if self.os_target and self.os_target not in OS_TARGETS:
             raise ValueError(f"os_target must be one of {OS_TARGETS}")
-        if self.engine not in ("camoufox", "chromium", "guns"):
-            raise ValueError("engine must be one of camoufox, chromium, guns")
+        if self.engine not in ("camoufox", "chromium", "api"):
+            raise ValueError("engine must be one of camoufox, chromium, api")
         if self.device not in ("desktop", "mobile", "tablet"):
             raise ValueError("device must be one of desktop, mobile, tablet")

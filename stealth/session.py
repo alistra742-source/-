@@ -392,7 +392,8 @@ class StealthFleet:
         self.hits = 0
         self.misses = 0
 
-        self._log("boot", f"fleet: {count} worker process(es) x {rounds} round(s) "
+        self._log("boot", f"fleet: {count} worker process(es) x "
+                          f"{'∞ (until stopped)' if rounds <= 0 else rounds} round(s) "
                           f"-> {cfg.url}")
 
         procs: List[Any] = []
@@ -414,7 +415,7 @@ class StealthFleet:
                 self._log("error", f"{wid}: spawn failed — {e}")
                 continue
             procs.append((wid, p))
-            pending.append(self._watch(wid, p))
+            pending.append(self._watch(wid, p, rounds))
             # Stagger cold starts: a fleet of simultaneous Firefox launches
             # spikes memory and CPU on a small host, which is what makes one of
             # them stall in the first place.
@@ -444,8 +445,15 @@ class StealthFleet:
                 reused=int(r.get("reused", 0)),
             )
 
-    async def _watch(self, wid: str, proc) -> Dict[str, Any]:
-        """Bound a worker so a stalled browser cannot hang the whole run."""
+    async def _watch(self, wid: str, proc, rounds: int = 1) -> Dict[str, Any]:
+        """Bound a worker so a stalled browser cannot hang the whole run.
+
+        A looping worker (``--rounds 0``) has no expected finish, so the ceiling
+        is not applied to it: the watchdog exists to catch a worker that will
+        never return, and a worker that is meant to never return is not that.
+        """
+        if rounds <= 0:
+            return await self._collect(wid, proc)
         try:
             return await asyncio.wait_for(
                 self._collect(wid, proc), timeout=self.config.worker_timeout_s

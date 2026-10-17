@@ -8,7 +8,7 @@ past Cloudflare, past JS fingerprinting, past the behavioural checks that flag
 stock automation.
 * **`--engine chromium`** — a fast Chromium fleet: one browser, many contexts,
 heavy resources aborted. Built for volume.
-* **`--engine guns`** — the native guns.lol protocol: challenge, WASM
+* **`--engine api`** — the native guns.lol protocol: challenge, WASM
 proof-of-work, signed POST. No page load, no browser, per view.
 
 Details of the last two are in [Three engines, one CLI](#three-engines-one-cli);
@@ -188,11 +188,16 @@ browser: run `python -m stealth <user> --contexts 1` for that path.
 
 `python -m stealth <user> --engine …`
 
-| engine | what it is | when |
+| `--engine` | what it is | API key? |
 |---|---|---|
-| `camoufox` (default) | the stealth rig above, one Firefox per worker | the site fights back and you need to get through |
-| `chromium` | a fast Chromium fleet: **one browser, many contexts**, heavy resources aborted | volume — many egresses, few launches |
-| `guns` | the native guns.lol protocol: no page load, no browser, per view | the view is the goal and you have tokens |
+| `camoufox` (default) | the stealth rig above, one Firefox per worker | no |
+| `chromium` | a fast Chromium fleet: **one browser, many contexts**, heavy resources aborted | no |
+| `api` | the native guns.lol protocol: no page load, no browser, per view | **yes** — a Turnstile token and a `cf_clearance` minted for that POST, from a captcha service or handed in |
+
+`guns` still works as an old name for `api`. An engine is named for *how it sends
+a view*; `guns` named the site, which is why nobody could tell which one needed a
+key. `--rounds 0` keeps any engine running until you stop it (Ctrl-C), keeping the
+browser and its context warm instead of relaunching per view.
 
 ### chromium — the volume rail
 
@@ -252,7 +257,7 @@ rotated constructor/solve exports, and the binary is driven in `node` by
 `stealth/powjs/runner.mjs`. The module is cached by challenge id.
 
 ```bash
-python -m stealth <user> --engine guns --count 20 --concurrency 4
+python -m stealth <user> --engine api --count 20 --concurrency 4
 ```
 
 Measured live: page fetch 0.5 s, module fetch 0.9 s (cache hit after the first
@@ -277,11 +282,11 @@ So a view needs two artifacts from a captcha service (or handed in):
 | Turnstile token | the widget's response token | it is the widget's signature; single-use, per view |
 
 ```bash
-python -m stealth <user> --engine guns --count 20 --concurrency 4 \
+python -m stealth <user> --engine api --count 20 --concurrency 4 \
   --captcha-provider capmonster --captcha-key $CAPTCHA_KEY
 
 # tokens minted elsewhere (a browser extension, a different service):
-python -m stealth <user> --engine guns --turnstile-token <tok> --cf-clearance <cookie>
+python -m stealth <user> --engine api --turnstile-token <tok> --cf-clearance <cookie>
 ```
 
 Three providers are wired, each with its own task shape and its own documented
@@ -304,7 +309,7 @@ rendered session also gets its own clearance cache key, because a clearance is
 bound to the IP that solved it and replaying one across two IPs gets it revoked:
 
 ```bash
-python -m stealth <user> --engine guns --count 40 \
+python -m stealth <user> --engine api --count 40 \
   --proxies 'http://user:pass_session-{session}_lifetime-30s@geo.iproyal.com:12345'
 ```
 
@@ -366,7 +371,7 @@ the exit IP — reuse across a different IP is the fastest way to get it revoked
   (a few hundred MB, on top of a 1.3 GB install), so ~2 workers on a 4-core/8 GB
   box is the honest number. More workers need more memory; on a small host use
   `--contexts 1`, or plan the fleet for the machine you actually have.
-- `--engine guns` was verified **up to** the Cloudflare gate: challenge scrape,
+- `--engine api` was verified **up to** the Cloudflare gate: challenge scrape,
   module fetch, rotation parsing, native proof-of-work and the POST are all
   exercised live, and the POST is refused with an honest stage (`post`). The
   provider-backed path (`--captcha-provider …`) is verified against a local stub
@@ -379,7 +384,7 @@ the exit IP — reuse across a different IP is the fastest way to get it revoked
 - `--engine chromium` on a host **without a display records no views** (measured:
   0 beacons in 67 s). It is a fast, honest page-load engine there — useful for
   proving an egress works, not for counting. Give it Xvfb/headed to count.
-- `--engine guns` is the only engine that was verified to reach the analytics
+- `--engine api` is the only engine that was verified to reach the analytics
   endpoint with a well-formed, proof-of-work-signed request. It stops at
   Cloudflare's challenge on that path by design; what clears it is a captcha
   token, not more stealth.

@@ -441,9 +441,15 @@ async def _one_call(call, base_url: str, *, provider=None, **kwargs):
 
 
 def _raises(fn, want_text: bool = False):
-    """Run fn; return True (or the exception text) when it raises."""
+    """Run fn; return True (or the exception text) when it raises.
+
+    Catches `SystemExit` too: argparse refuses a bad choice by calling `sys.exit`,
+    and that refusal is the behaviour under test — not a reason to end the suite.
+    """
     try:
         fn()
+    except SystemExit as e:  # argparse refuses by exiting
+        return str(e) if want_text else True
     except Exception as e:
         return str(e) if want_text else True
     return False if not want_text else "did not raise"
@@ -548,6 +554,49 @@ def check_display_deps(_tmp: str, check) -> None:
           f"lost {[p for p in ld.SEED_PACKAGES if p not in asked]}")
     check("M4 the unpack refuses to ship a second glibc",
           {"libc6", "libc6-dev", "libstdc++6"}.issubset(ld.SKIP), f"SKIP={ld.SKIP}")
+
+
+def check_engine_names(_tmp: str, check) -> None:
+    """The engine names say what they do, and the old name still resolves."""
+    import argparse
+
+    sys.path.insert(0, os.path.join(ROOT, "stealth"))
+    from stealth.cli import build_parser, config_from_args
+    from stealth.config import StealthConfig
+
+    parser = build_parser()
+    args = parser.parse_args(["someone", "--engine", "guns"])
+    cfg = config_from_args(args)
+    check("N1 the old 'guns' name still selects the API engine",
+          cfg.engine == "api", f"got {cfg.engine!r}")
+    args = parser.parse_args(["someone", "--engine", "api"])
+    check("N2 'api' is accepted by name", config_from_args(args).engine == "api")
+    for name in ("camoufox", "chromium"):
+        a = parser.parse_args(["someone", "--engine", name])
+        check(f"N3 --engine {name} is a browser engine, and needs no key",
+              config_from_args(a).engine == name
+              and not config_from_args(a).captcha_key)
+    check("N4 an unknown engine is refused at parse time",
+          _raises(lambda: parser.parse_args(["someone", "--engine", "browser"])))
+    check("N5 config.validate refuses an engine it cannot drive",
+          _raises(lambda: StealthConfig(target="someone", engine="playwright").validate(), True)
+          != "did not raise")
+
+    # --rounds 0 must survive parsing as the loop sentinel, not become 1.
+    a = parser.parse_args(["someone", "--rounds", "0"])
+    check("N6 --rounds 0 parses as the loop-until-stopped sentinel", a.rounds == 0, f"got {a.rounds}")
+    check("N7 a positive round count is unchanged", parser.parse_args(["someone", "--rounds", "7"]).rounds == 7)
+
+    # The help is the interface: it has to name the engines by mechanism, say
+    # which ones need a key, and say what 0 rounds means.
+    actions = {a.dest: a for a in parser._actions}
+    engines = tuple(actions["engine"].choices)
+    help_text = actions["engine"].help + actions["rounds"].help
+    check("N8 the engine choices are the canonical names plus the legacy alias",
+          set(engines) == {"camoufox", "chromium", "api", "guns"}, f"got {engines}")
+    check("N9 the help says which engines need no key, and what 0 rounds means",
+          help_text.count("no API key") >= 2 and "loops until" in help_text,
+          f"got {help_text!r}")
 
 
 def check_proxy_session(tmp: str, check) -> None:

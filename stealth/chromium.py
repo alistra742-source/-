@@ -521,9 +521,12 @@ class ChromiumFleet:
         await session.start()
         self._sessions.append(session)
         try:
-            for r in range(max(1, rounds)):
-                if not self._running:
-                    return
+            # `rounds <= 0` = keep going until the run is stopped. The context
+            # stays warm, which is the point of looping: a page load is cheap, a
+            # browser and context are not.
+            done = 0
+            while self._running and (rounds <= 0 or done < rounds):
+                done += 1
                 try:
                     report = await session.load()
                     self.loads.append(report.ms)
@@ -544,7 +547,7 @@ class ChromiumFleet:
                                               "widget needs a real Turnstile solve. Headless "
                                               "Chromium with no display does not finish one, so "
                                               "nothing here counts — use a display (Xvfb), or "
-                                              "--engine guns with captcha tokens.")
+                                              "--engine api with captcha tokens.")
                     else:
                         self.misses += 1
                         self.last_error = f"status {report.status} {report.detail}"
@@ -553,7 +556,7 @@ class ChromiumFleet:
                     self.misses += 1
                     self.last_error = str(e).splitlines()[0]
                     self._log("miss", f"{wid}: {self.last_error}")
-                if r + 1 < rounds:
+                if rounds <= 0 or done < rounds:
                     await asyncio.sleep(_rand_range(gap) / 1000.0)
         finally:
             await session.stop()
@@ -569,7 +572,9 @@ class ChromiumFleet:
         assignments = self._assign(count)
 
         ensure_host_env()
-        self._log("boot", f"fleet: {count} context(s) in 1 browser x {rounds} round(s) -> {self.config.url}")
+        self._log("boot", f"fleet: {count} context(s) in 1 browser x "
+                          f"{'∞ (until stopped)' if rounds <= 0 else rounds} round(s) "
+                          f"-> {self.config.url}")
         self._log("boot", "egress " + (
             f"{len({p.label for p in assignments if p})} prox(ies) (per-context)"
             if any(assignments) else "direct"))

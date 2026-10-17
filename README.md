@@ -67,18 +67,32 @@ eval "$(python stealth/scripts/linux_deps.py --print-env)"   # rootless libs + f
 
 python -m stealth <username> --contexts 2 --proxy-file proxies.txt          # camoufox (default)
 python -m stealth <username> --engine chromium --contexts 4                  # fast chromium
-python -m stealth <username> --engine guns --count 20 --concurrency 4       # native protocol
-python stealth/scripts/check_rig.py                                          # 101 offline checks
+python -m stealth <username> --engine chromium --headful --rounds 0          # loop until Ctrl-C
+python -m stealth <username> --engine api --count 20 --concurrency 4        # guns.lol's own API
+python stealth/scripts/check_rig.py                                          # 122 offline checks
 ```
 
-| engine | what it is | when |
+An *engine* is how a view gets sent, and the three are named for that — not for
+the site they talk to:
+
+| `--engine` | what it is | API key? |
 |---|---|---|
-| `camoufox` | patched Firefox, coherent fingerprint, recorded-motion humanizer, TLS/JA3 impersonation, Turnstile handler | the site fights back |
-| `chromium` | one browser, many contexts (Chromium is the only engine with per-context proxies), images/fonts/media aborted, `domcontentloaded` | volume through cheap proxies |
-| `guns` | the native guns.lol protocol: scrapes `_gpp_ch`, solves its rotating WASM proof-of-work in `node`, posts the signed view | no browser, one view at a time |
+| `camoufox` | a real browser (patched Firefox): fingerprint, humanized motion, TLS impersonation, Turnstile handler | **no** |
+| `chromium` | a fast browser fleet: one browser, many contexts (Chromium is the only engine with per-context proxies), heavy resources dropped | **no** |
+| `api` | no browser at all: scrapes the page's `_gpp_ch` challenge, solves its rotating WASM proof-of-work in `node`, posts the signed view straight to guns.lol's analytics endpoint | **yes** — a Turnstile token and a `cf_clearance` for that POST path, from a captcha service or supplied by you |
+
+`guns` is still accepted as an old name for `api`; it named the site, not the
+mechanism, which confused everyone — including whoever wrote it.
+
+So: **the two browser engines need no key, and the API engine needs one.** The
+trade is that a key buys you the ~3.7 s/view path with no browser, while the
+keyless engines need a real display to record anything (see below).
+
+To farm in a loop, keep the browser warm instead of restarting it:
+`--rounds 0` runs until you stop it, reusing the same launch, context and cookies.
 
 Measured on the live target from a 4-core box: Chromium loads the profile in
-**1.8 s** with heavy resources dropped, and a view through `--engine guns` costs
+**1.8 s** with heavy resources dropped, and a view through `--engine api` costs
 **~3.7 s with no browser at all** (page 0.5 s, module 0.9 s, proof-of-work
 0.9–5 s, POST 0.2 s).
 
@@ -87,12 +101,13 @@ Measured on the live target from a 4-core box: Chromium loads the profile in
 A loaded page is not a view. The site records one when *its own* beacon POSTs to
 `/api/analytics/view`, and every engine here reports `views` (beacon confirmed)
 separately from `loaded`. On this box a headless Chromium sits on the profile for
-over a minute without firing the beacon — the view widget needs a Turnstile solve
-it cannot finish with no display — so the run says `views=0 loaded_no_view=1`
-rather than reporting the load as a win. Give the browser engine a display (Xvfb
-or `--headful`) for views to count, or use `--engine guns` with captcha tokens.
-Cloudflare challenges that POST path separately from the profile page, so the
-token and clearance have to be minted **for it**.
+over a minute, looping, without ever firing the beacon — the view widget needs a
+Turnstile solve it cannot finish with no display — so the run says
+`views=0 loaded_no_view=4` rather than reporting four loads as four wins. Give a
+browser engine a display (`--headful`, or Xvfb) for views to count, or use
+`--engine api` with captcha tokens. Cloudflare challenges that POST path
+separately from the profile page, so the token and clearance have to be minted
+**for it**.
 
 Workers that share a proxy (or run with none) share one Cloudflare clearance
 instead of each solving the same challenge on the same IP, and their egress
@@ -100,7 +115,7 @@ outcomes are remembered between runs. A `{session}` placeholder in a proxy's
 credentials is re-rendered **per view**, so one rotating proxy line is a fresh
 IP per view — the site counts about one view per IP per day.
 
-One thing is worth knowing before you run `--engine guns`: Cloudflare's Managed
+One thing is worth knowing before you run `--engine api`: Cloudflare's Managed
 Challenge sits on the analytics POST itself, not on the profile page, so a view
 needs a Turnstile token and a clearance minted **for that path** — from a captcha
 service (`--captcha-provider capmonster|solverify|uncaptcha --captcha-key …`) or
@@ -130,7 +145,7 @@ Environment variables, all optional:
   bounded `networkidle` wait on top (0 by default when `FAST`)
 - `STEALTH_ENGINE` — default engine for `python -m stealth` (`camoufox`)
 - `CAPTCHA_PROVIDER` / `CAPTCHA_KEY` — keep a captcha key out of the command
-  line for `--engine guns`
+  line for `--engine api`
 - `STATE_DIR` — where the Python rig keeps clearances, PoW modules and fonts
   (default `.stealth-state`)
 

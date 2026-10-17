@@ -68,6 +68,10 @@ async def _rounds(cfg: StealthConfig, proxy, wid: str, rounds: int, log) -> Dict
     A launch failure propagates (nothing ran, nothing is counted). A failure
     *inside* a round is caught and counted as a miss, because a navigation was
     genuinely attempted — that worker must not be retried and double-counted.
+
+    `rounds <= 0` means loop until the parent stops the run (Ctrl-C): the browser
+    is launched once and kept warm, which is the cheap way to farm views, since a
+    launch is the most expensive thing either browser engine does.
     """
     session = StealthSession(cfg, proxy=proxy, worker_id=wid, log=log)
     hits = 0
@@ -78,7 +82,8 @@ async def _rounds(cfg: StealthConfig, proxy, wid: str, rounds: int, log) -> Dict
         # in new_page often enough to matter); stop() releases whatever came up
         # before the failure propagates, so a relaunch is not two browsers.
         await session.start()
-        for r in range(rounds):
+        done = 0
+        while rounds <= 0 or done < rounds:
             try:
                 ok = await session.hit()
                 hits += 1 if ok else 0
@@ -87,7 +92,8 @@ async def _rounds(cfg: StealthConfig, proxy, wid: str, rounds: int, log) -> Dict
                 misses += 1
                 error = str(e).splitlines()[0] if str(e) else type(e).__name__
                 log("miss", error)
-            if r + 1 < rounds:
+            done += 1
+            if rounds <= 0 or done < rounds:
                 await asyncio.sleep(random.uniform(*cfg.round_gap) / 1000)
     finally:
         stats = session.egress_stats()
@@ -106,7 +112,8 @@ async def _rounds(cfg: StealthConfig, proxy, wid: str, rounds: int, log) -> Dict
 async def _run(job: Dict[str, Any]) -> Dict[str, Any]:
     cfg, proxy = _config_from_job(job)
     wid = job.get("worker_id", "1.1")
-    rounds = max(1, int(job.get("rounds", 1)))
+    # 0 or less is the loop-until-stopped sentinel, so it is not floored to 1.
+    rounds = int(job.get("rounds", 1) or 0)
     max_retries = max(0, int(cfg.launch_retries))
 
     # Messages from StealthSession already carry the worker id; don't repeat it.

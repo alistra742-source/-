@@ -514,6 +514,22 @@ def check_worker_retry(tmp: str) -> None:
         check("G6 --launch-retries 0 leaves a dead launch dead",
               FakeSession.start_calls == 1 and res["misses"] == 1,
               f"starts={FakeSession.start_calls} got {res}")
+
+        # --rounds 0 is the loop-until-stopped sentinel: it must not be floored
+        # to one round, and the browser must be launched only once for all of it.
+        arm(fail_starts=0, hit_raises=False)
+        try:
+            asyncio.run(asyncio.wait_for(W._run({**job, "rounds": 0}), timeout=0.5))
+        except asyncio.TimeoutError:
+            pass
+        check("G7 --rounds 0 keeps looping instead of stopping after one round",
+              FakeSession.hits >= 3, f"hits after 0.5s={FakeSession.hits}")
+        check("G8 the looping worker launched the browser exactly once",
+              FakeSession.start_calls == 1, f"starts={FakeSession.start_calls}")
+        arm(fail_starts=0, hit_raises=False)
+        res = asyncio.run(W._run({**job, "rounds": 2}))
+        check("G9 a positive round count is still obeyed exactly",
+              res["hits"] == 2 and res["misses"] == 0, f"got {res}")
     finally:
         W.StealthSession = original  # type: ignore[assignment]
 
@@ -522,6 +538,7 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="rig-check-")
     print(f"stealth rig checks — state under {tmp}")
     from check_rig_extra import (check_captcha, check_chromium_env, check_display_deps,
+                                 check_engine_names,
                                  check_guns_protocol, check_pow_harness, check_proxy_session)
 
     # The suites in check_rig_extra take the reporter as an argument so they can
@@ -530,7 +547,7 @@ def main() -> int:
                                   check_worker_retry)]
     suites += [(fn, (check,)) for fn in (check_guns_protocol, check_pow_harness,
                                          check_captcha, check_chromium_env,
-                                         check_display_deps, check_proxy_session)]
+                                         check_display_deps, check_engine_names, check_proxy_session)]
     try:
         for fn, extra in suites:
             try:

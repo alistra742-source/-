@@ -44,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="browser instances (each its own proxy) [env BROWSERS]")
     p.add_argument("--tabs", type=int, default=_env_int("PAGES", 1),
                    help="workers per browser [env PAGES]")
-    p.add_argument("--rounds", type=int, default=1, help="navigation rounds per worker")
+    p.add_argument("--rounds", type=int, default=1,
+                   help="navigation rounds per worker; 0 loops until you stop it")
     p.add_argument("--headful", action="store_true", default=bool(os.environ.get("HEADFUL")),
                    help="show the browser window")
     p.add_argument("--virtual", action="store_true",
@@ -80,11 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the Camoufox config sent to the browser (leak check)")
 
     eng = p.add_argument_group("engines")
-    eng.add_argument("--engine", choices=("camoufox", "chromium", "guns"),
+    eng.add_argument("--engine", choices=("camoufox", "chromium", "api", "guns"),
                      default=os.environ.get("STEALTH_ENGINE", "camoufox"),
-                     help="camoufox = stealth rig (default); chromium = fast Chromium "
-                          "fleet, one browser many contexts; guns = the native guns.lol "
-                          "protocol, no page load at all")
+                     help="camoufox = stealth browser (default, no API key); chromium = "
+                          "fast browser fleet, one browser many contexts (no API key); "
+                          "api = talk to guns.lol's own endpoints directly, no browser "
+                          "(needs a captcha key or your own tokens). 'guns' is the old "
+                          "name for 'api'.")
     eng.add_argument("--no-fast", action="store_true",
                      help="chromium: load the full page (stylesheets, images, fonts) "
                           "and wait for 'load' instead of dropping heavy resources")
@@ -96,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     eng.add_argument("--idle-wait", type=int, default=0,
                      help="chromium: also wait up to N ms for networkidle (default 0)")
 
-    guns = p.add_argument_group("native guns.lol protocol (--engine guns)")
+    guns = p.add_argument_group("native guns.lol protocol (--engine api, alias guns)")
     guns.add_argument("--count", type=int, default=1, help="views to record (default 1)")
     guns.add_argument("--concurrency", type=int, default=4,
                       help="views recorded at once (default 4)")
@@ -151,7 +154,7 @@ def config_from_args(args: argparse.Namespace) -> StealthConfig:
         launch_retries=max(0, args.launch_retries),
         share_clearance=not args.no_share_clearance,
         clearance_wait_s=float(args.clearance_wait),
-        engine=args.engine,
+        engine="api" if args.engine == "guns" else args.engine,
         fast_browser=not args.no_fast,
         drop_resources=tuple(x.strip() for x in str(args.drop).split(",") if x.strip()),
         wait_until=args.wait_until,
@@ -185,13 +188,16 @@ async def _run(args: argparse.Namespace) -> int:
         up = f"{(time.time() - started):5.0f}s"
         print(f"[{up}][{tag}] {msg}", flush=True)
 
-    if cfg.engine == "guns":
+    if cfg.engine == "api":
         return await _run_guns(cfg, args, log)
 
     fleet = ChromiumFleet(cfg, fast=cfg.fast_browser, log=log) if cfg.engine == "chromium" \
         else StealthFleet(cfg, log=log)
+    rounds = max(0, args.rounds)
+    if rounds == 0:
+        log("boot", "--rounds 0: looping until you stop it (Ctrl-C)")
     try:
-        status = await fleet.run(rounds=max(1, args.rounds))
+        status = await fleet.run(rounds=rounds)
     except KeyboardInterrupt:
         await fleet.stop()
         log("stop", "interrupted")
