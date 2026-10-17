@@ -16,6 +16,12 @@ that directory on `LD_LIBRARY_PATH`.
     python stealth/scripts/linux_deps.py           # unpack into .foxlibs
     eval "$(python stealth/scripts/linux_deps.py --print-env)"   # export it
 
+`--with-display` adds Xvfb and its XKB data, which is what `--virtual` needs to
+run a headed browser on a host with no display. Note the one thing this cannot
+supply from a userspace unpack: Xvfb runs `/usr/bin/xkbcomp` by absolute path, so
+on a machine where that path does not exist the server refuses to start
+(`Failed to activate virtual core keyboard`). On any normal host it is there.
+
 Never unpack libc locally — prepending a second glibc breaks the very child
 processes this is meant to fix.
 """
@@ -53,10 +59,21 @@ SEED_PACKAGES = [
     "libcups2t64", "libcups2", "libavahi-client3", "libavahi-common3",
 ]
 
+# A private X display, for the rig's headless-host mode: `--virtual` runs a
+# *headed* browser on Xvfb, which is materially harder to fingerprint than
+# headless. Opt-in, because it drags in ~60 packages nobody needs otherwise.
+DISPLAY_PACKAGES = ["xvfb", "x11-xkb-utils", "xkb-data"]
+
 SKIP = {
     "libc6", "libc6-dev", "libcrypt1", "libgcc-s1", "libgcc1",
     "libstdc++6", "dpkg", "perl-base",
 }
+
+
+def seed_packages(argv: list) -> list[str]:
+    """The package set for this invocation — Xvfb only when asked for."""
+    want_display = any(a in ("--with-display", "--virtual") for a in (argv or []))
+    return list(SEED_PACKAGES) + (list(DISPLAY_PACKAGES) if want_display else [])
 
 
 def _has(cmd: str) -> bool:
@@ -130,17 +147,19 @@ def main() -> int:
         print("need apt-get and dpkg-deb", file=sys.stderr)
         return 2
 
+    packages = seed_packages(sys.argv)
+
     as_root = hasattr(os, "geteuid") and os.geteuid() == 0
     if as_root:
         print("[deps] root detected — apt-get install.")
-        r = subprocess.run(["apt-get", "install", "-y"] + SEED_PACKAGES + ["libgtk-3-0"])
+        r = subprocess.run(["apt-get", "install", "-y"] + packages + ["libgtk-3-0"])
         return r.returncode
 
     tmp = PROJECT_ROOT / ".fxlibs-tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     try:
         wanted: set[str] = set()
-        queue = list(SEED_PACKAGES)
+        queue = list(packages)
         for rnd in range(6):
             if not queue:
                 break

@@ -531,6 +531,25 @@ def check_chromium_env(tmp: str, check) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def check_display_deps(_tmp: str, check) -> None:
+    """The dependency helper only drags Xvfb in when a display is asked for."""
+    sys.path.insert(0, os.path.join(ROOT, "stealth", "scripts"))
+    import linux_deps as ld  # noqa: E402
+
+    plain = ld.seed_packages([])
+    asked = ld.seed_packages(["--with-display"])
+    check("M1 the default install set does not pull in an X server",
+          not any("xvfb" in p for p in plain), f"got {[p for p in plain if 'xvfb' in p]}")
+    check("M2 --with-display adds Xvfb, the XKB compiler and the keymap data",
+          all(p in asked for p in ld.DISPLAY_PACKAGES) and "xkb-data" in asked,
+          f"got {[p for p in ld.DISPLAY_PACKAGES if p not in asked]}")
+    check("M3 asking for a display never removes the browser stack",
+          all(p in asked for p in ld.SEED_PACKAGES),
+          f"lost {[p for p in ld.SEED_PACKAGES if p not in asked]}")
+    check("M4 the unpack refuses to ship a second glibc",
+          {"libc6", "libc6-dev", "libstdc++6"}.issubset(ld.SKIP), f"SKIP={ld.SKIP}")
+
+
 def check_proxy_session(tmp: str, check) -> None:
     rotating = Proxy(server="http://geo.iproyal.com:12345",
                      username="user",

@@ -20,3 +20,6 @@ server.log
 .stealth-state/
 __pycache__/
 *.pyc
+
+# rootless dependency unpack: fetched .deb archives and their work tree
+*.deb

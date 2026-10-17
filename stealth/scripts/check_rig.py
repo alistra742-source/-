@@ -521,8 +521,8 @@ def check_worker_retry(tmp: str) -> None:
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="rig-check-")
     print(f"stealth rig checks — state under {tmp}")
-    from check_rig_extra import (check_captcha, check_chromium_env, check_guns_protocol,
-                                 check_pow_harness, check_proxy_session)
+    from check_rig_extra import (check_captcha, check_chromium_env, check_display_deps,
+                                 check_guns_protocol, check_pow_harness, check_proxy_session)
 
     # The suites in check_rig_extra take the reporter as an argument so they can
     # be imported without importing this module's globals back.
@@ -530,7 +530,7 @@ def main() -> int:
                                   check_worker_retry)]
     suites += [(fn, (check,)) for fn in (check_guns_protocol, check_pow_harness,
                                          check_captcha, check_chromium_env,
-                                         check_proxy_session)]
+                                         check_display_deps, check_proxy_session)]
     try:
         for fn, extra in suites:
             try:

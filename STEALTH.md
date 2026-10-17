@@ -347,8 +347,20 @@ the exit IP — reuse across a different IP is the fastest way to get it revoked
   loses. Pair it with residential/mobile egress.
 - `cf_clearance` is short-lived and IP-bound. The cache is a convenience for
   repeated hits through the *same* proxy in a session, not a long-term pass.
-- Camoufox's `virtual` headless (headed on Xvfb) is stealthier than headless
-  mode on a VPS, where there is no real display to render to.
+- A *headed* browser is materially harder to detect than a headless one, which
+  is the whole point of `--virtual` (headed, on a private Xvfb display) — and it
+  is also the only configuration in which a browser here records a view, since
+  the profile's widget has to complete a Turnstile. Get the X server without
+  root:
+
+  ```bash
+  python stealth/scripts/linux_deps.py --with-display   # adds Xvfb + XKB data
+  eval "$(python stealth/scripts/linux_deps.py --print-env)"
+  ```
+
+  One caveat this cannot paper over: Xvfb runs `/usr/bin/xkbcomp` by absolute
+  path, so on a host where that file does not exist the server dies with
+  `Failed to activate virtual core keyboard`. On a normal machine it is there.
 - Keep Playwright below 1.63 — Camoufox pins the driver interface.
 - Concurrency is bounded by RAM, not by the code. Each worker is a real Firefox
   (a few hundred MB, on top of a 1.3 GB install), so ~2 workers on a 4-core/8 GB
